@@ -1,6 +1,6 @@
 {
   "name": "flowlearn-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server exposing Flowlearn tenant-admin course-creation tools.",
   "private": true,
   "type": "module",

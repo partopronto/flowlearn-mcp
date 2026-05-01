@@ -33,7 +33,17 @@ Prompts (slash commands in Claude Code):
 - /flowlearn:audit-course           Lint a course for publish-blockers
 - /flowlearn:import-markdown        Convert a markdown doc to a course tree
 
-Authoring quickstart:
+Authoring — fast path (preferred):
+  1. flowlearn_setup_status                          → orient
+  2. flowlearn_course_outline_apply  { course: {...nested tree...} }
+                                                     → builds course + modules + lessons
+                                                       + flow steps + connections
+                                                       + marks flow_completed=true
+                                                       in ONE call (with rollback on error)
+  3. flowlearn_course_lint           { course_id }   → confirm publish_ready=true
+  4. flowlearn_course_update         { course_id, status: "published" }
+
+Authoring — manual / surgical-edit path:
   1. flowlearn_setup_status                                    → orient
   2. flowlearn_course_create   { title, topic }                → c1
   3. flowlearn_module_create   { course_id: c1, title }        → m1
@@ -42,7 +52,8 @@ Authoring quickstart:
   6. flowlearn_flow_step_create { lesson_id: l1, title, content }                          → s2
   7. flowlearn_connection_add  { flow_step_id: s1, to_step_id: s2, button_text: "Next", button_order: 1 }
   8. flowlearn_lesson_update   { lesson_id: l1, flow_completed: true }   ← REQUIRED before publish
-  9. flowlearn_course_update   { course_id: c1, status: "published" }
+  9. flowlearn_course_lint     { course_id: c1 }     → recommended sanity check
+ 10. flowlearn_course_update   { course_id: c1, status: "published" }
 `,
 
   publishing: `# Publishing rules

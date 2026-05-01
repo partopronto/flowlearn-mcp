@@ -4,13 +4,14 @@ MCP server that exposes Flowlearn course-creation actions to Claude Code (termin
 
 ## What it does
 
-A full MCP surface — 30 tools, 3 resource templates, 3 user-invokable prompts (slash commands), completion, and structured logging. Mirrors what a tenant admin can do in the course-creation UI. Server-side AI is intentionally not exposed (no `createWithAI`, no `improve`, no interview tools); the calling agent generates content and persists it via the dedicated tools.
+A full MCP surface — 32 tools, 3 resource templates, 3 user-invokable prompts (slash commands), completion, and structured logging. Mirrors what a tenant admin can do in the course-creation UI. Server-side AI is intentionally not exposed (no `createWithAI`, no `improve`, no interview tools); the calling agent generates content and persists it via the dedicated tools.
 
-### Tools (30)
+### Tools (32)
 
 - **Help (1)** — `flowlearn_help`
 - **Setup (3)** — `flowlearn_setup_status`, `flowlearn_setup_switch_tenant`, `flowlearn_setup_update`
 - **Course (5)** — `flowlearn_course_list`, `flowlearn_course_get`, `flowlearn_course_create`, `flowlearn_course_update`, `flowlearn_course_delete`
+- **Course authoring & quality (2)** — `flowlearn_course_outline_apply` (one-shot course creation from a nested outline), `flowlearn_course_lint` (publish-readiness audit)
 - **Module (5)** — `flowlearn_module_list`, `flowlearn_module_create`, `flowlearn_module_update`, `flowlearn_module_delete`, `flowlearn_module_reorder`
 - **Lesson (5)** — `flowlearn_lesson_list`, `flowlearn_lesson_get`, `flowlearn_lesson_create`, `flowlearn_lesson_update`, `flowlearn_lesson_delete`
 - **FlowStep (7)** — `flowlearn_flow_step_list`, `flowlearn_flow_step_create`, `flowlearn_flow_step_update`, `flowlearn_flow_step_delete`, `flowlearn_flow_step_reorder`, `flowlearn_flow_step_upload_image`, `flowlearn_flow_step_delete_image`
@@ -102,7 +103,7 @@ claude mcp list           # should show 'flowlearn ✓ Connected'
 claude mcp get flowlearn  # shows config including env values
 ```
 
-Inside a Claude Code session, `/mcp` shows the server status and 30 tools. If you change credentials, restart any open session.
+Inside a Claude Code session, `/mcp` shows the server status and 32 tools. If you change credentials, restart any open session.
 
 ### Alternative — manual `claude mcp add`
 
@@ -136,7 +137,7 @@ Add to `claude_desktop_config.json` (Mac: `~/Library/Application Support/Claude/
 }
 ```
 
-Restart Claude Desktop. The 30 tools appear under the `flowlearn` server.
+Restart Claude Desktop. The 32 tools appear under the `flowlearn` server.
 
 ## For Claude / AI agents — how to use this MCP
 
@@ -160,9 +161,44 @@ Always call a `*_list` or `*_get` tool to find IDs before you call `*_update` or
 
 Recommended discovery sequence: `flowlearn_course_list` → pick course id → `flowlearn_course_get` (shows modules) → pick module id → `flowlearn_lesson_list` → pick lesson id → `flowlearn_flow_step_list` (shows steps + connections in one call).
 
-### Creating a course from scratch — canonical sequence
+### Creating a course in one call — `flowlearn_course_outline_apply`
 
-This is the only correct order. Skipping a step or reordering will produce silently broken courses.
+For greenfield courses, prefer this over the per-entity sequence below. Pass a nested outline and the MCP creates the course, modules, lessons, flow steps, connections, and marks every lesson `flow_completed=true` in a single call. If anything fails partway through, the partial course is rolled back (cascade-deleted) so the tenant stays clean.
+
+```json
+{
+  "course": {
+    "title": "Spanish Greetings",
+    "topic": "Greetings in Spanish",
+    "language": "en",
+    "modules": [
+      {
+        "title": "Hellos",
+        "objectives": ["Say hello at any time of day"],
+        "lessons": [
+          {
+            "title": "Saying Hello",
+            "steps": [
+              {"title": "Buenos días", "content": "Good morning."},
+              {"title": "Hola", "content": "Most common, any time."}
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+By default, steps in a lesson are wired in a linear chain with "Next" buttons; supply explicit `connections` per lesson to override (branching, terminal buttons). After it returns, call `flowlearn_course_lint` and then publish via `flowlearn_course_update status: "published"`.
+
+### Linting before publish — `flowlearn_course_lint`
+
+Read-only audit. Returns `publish_ready: boolean`, plus `issues[]` with `severity` (`error`/`warning`), `code`, `message`, and `fix_hint` per problem. Errors are publish-blockers (e.g., `NO_STARTING_STEP`, `DANGLING_CONNECTION`); warnings flag quality issues (`UNREACHABLE_STEP`, `EMPTY_STEP_CONTENT`, `LESSON_NOT_FLOW_COMPLETED`). Designed to be run in a fix-loop: lint → apply top-error fix → re-lint until publish_ready.
+
+### Creating a course manually — canonical sequence
+
+For surgical edits or when you need fine control. This is the only correct order; skipping a step will produce silently broken courses.
 
 1. `flowlearn_course_create` — `{title, topic}`. Both required. Returns `{entity: {id, ...}, summary, url, next_actions}`.
 2. `flowlearn_module_create` — once per module. Returns `{entity: {id, order_index, ...}, ...}`.

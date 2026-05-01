@@ -108,7 +108,7 @@ function scaffoldCoursePrompt(
   const title = args.title;
   const language = args.language ?? "en";
 
-  const text = `You are scaffolding a flowlearn course from a free-form outline.
+  const text = `You are scaffolding a flowlearn course from a free-form outline. Use the ONE-SHOT path below — do NOT chain individual create tools unless the user asks for that explicitly.
 
 OUTLINE:
 ${outline.trim() || "(none provided — ask the user)"}
@@ -116,25 +116,39 @@ ${outline.trim() || "(none provided — ask the user)"}
 ${title ? `Course title (provided): ${title}` : "Infer the course title from the outline."}
 Language: ${language}
 
-Steps to follow exactly:
+Steps:
 1. Call flowlearn_setup_status. Confirm the active tenant is the one the user expects. If not, ASK before proceeding.
 2. Read flowlearn://docs/overview if you haven't this session.
-3. Parse the outline into a tree:
+3. Parse the outline into a nested tree mapping:
    - Top-level groupings → modules
-   - Sub-items → lessons
-   - Leaf items / paragraphs → flow steps
-   If the outline is flat, propose a structure to the user before creating anything.
-4. Call flowlearn_course_create with { title, topic, language: "${language}" }. Use the topic as a 1-line summary of the outline.
-5. For each module, call flowlearn_module_create with { course_id, title, content: { objectives } } where objectives is a 1-3 item list extracted from the outline.
-6. For each lesson, call flowlearn_lesson_create with { module_id, title, description }.
-7. For each lesson, create at least 2 flow steps: the FIRST one MUST have is_starting_step: true. Use step_type: "message" by default; "quiz" for check-your-understanding leaves.
-8. Wire flowlearn_connection_add between consecutive steps with button_text: "Next", button_order: 1.
-9. Once a lesson's steps + connections are in place, call flowlearn_lesson_update with flow_completed: true.
-10. Do NOT call flowlearn_course_update with status: "published" automatically. Report the course URL and ask the user to review before publishing.
+   - Sub-items → lessons (each lesson must have ≥1 step)
+   - Leaf items / paragraphs → flow steps (each step needs title + content; default step_type: "message", use "quiz" for check-your-understanding leaves)
+   If the outline is flat or ambiguous, propose a structure to the user FIRST. Don't guess silently.
+4. Call flowlearn_course_outline_apply ONCE with the full tree:
+     {
+       "course": {
+         "title": "...",
+         "topic": "...",
+         "language": "${language}",
+         "modules": [
+           { "title": "...", "objectives": ["..."], "lessons": [
+             { "title": "...", "steps": [ {"title":"...","content":"..."}, ... ] }
+           ]}
+         ]
+       },
+       "client_request_id": "<random>",
+       "dry_run": false
+     }
+   Defaults you DO NOT need to set: mark_flow_completed=true (good), publish=false (good — don't auto-publish), connections=linear-chain-with-Next-buttons (good for most outlines).
+5. Inspect the response. If it errored, the partial course was rolled back; surface details.partial_tree to the user and propose a fix.
+6. Call flowlearn_course_lint with the new course_id. If publish_ready=true and the user is happy, ASK whether to publish. If publish_ready=false, summarize the issues to the user.
+7. Do NOT auto-publish. Report the course URL (entity.url in the response) and let the user trigger flowlearn_course_update status="published".
 
-Use client_request_id on every *_create call to make retries safe (any short opaque string per call).
+Override-only — call individual *_create tools instead if:
+  - The user explicitly wants to add to an EXISTING course (outline_apply only creates new courses).
+  - The outline has a complex non-linear flow (branching with multiple buttons per step) AND you need fine control. Even then, prefer outline_apply with explicit connections[] arrays per lesson.
 
-If anything is ambiguous in the outline, ASK before creating. It is much cheaper to ask than to clean up a bad scaffold.`;
+If anything is ambiguous in the outline, ASK before creating. Cheap question vs. expensive cleanup.`;
 
   return {
     description: SCAFFOLD_COURSE.description,

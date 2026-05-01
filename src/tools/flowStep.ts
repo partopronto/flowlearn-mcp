@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { z } from "zod";
 import type { FlowlearnClient } from "../client.js";
 import {
@@ -6,12 +8,193 @@ import {
   PaginationFields,
   editorUrl,
   entityResult,
+  errorResult,
   getIdempotent,
   listResult,
   paginate,
   setIdempotent,
   type ToolDef,
 } from "./common.js";
+
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+type ImageFormat = "png" | "jpeg" | "gif" | "webp";
+
+class ImageInputError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly suggestion: string,
+    public readonly retriable: boolean,
+  ) {
+    super(message);
+    this.name = "ImageInputError";
+  }
+}
+
+function sniffImageFormat(buf: Buffer): ImageFormat | null {
+  if (buf.length < 12) return null;
+  if (
+    buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 &&
+    buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a
+  ) return "png";
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpeg";
+  if (
+    buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38 &&
+    (buf[4] === 0x37 || buf[4] === 0x39) && buf[5] === 0x61
+  ) return "gif";
+  if (
+    buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+    buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+  ) return "webp";
+  return null;
+}
+
+async function readImageFromPath(p: string): Promise<Buffer> {
+  if (!path.isAbsolute(p)) {
+    throw new ImageInputError(
+      "INVALID_ARGUMENTS",
+      `image_path must be an absolute path; got '${p}'.`,
+      "Pass a fully-qualified path (e.g. C:\\Users\\me\\shot.png on Windows, /home/me/shot.png on Linux/macOS). The MCP server's CWD is not assumed.",
+      false,
+    );
+  }
+  try {
+    return await fs.readFile(p);
+  } catch (err) {
+    throw new ImageInputError(
+      "IMAGE_READ_FAILED",
+      `Could not read image at ${p}: ${(err as Error).message}`,
+      "Check that the file exists and is readable by the MCP server process.",
+      true,
+    );
+  }
+}
+
+async function fetchImageFromUrl(url: string): Promise<Buffer> {
+  if (!/^https?:\/\//i.test(url)) {
+    throw new ImageInputError(
+      "INVALID_ARGUMENTS",
+      `image_url must be http(s); got '${url}'.`,
+      "Use a public http(s) URL the MCP server can reach.",
+      false,
+    );
+  }
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (err) {
+    throw new ImageInputError(
+      "IMAGE_FETCH_FAILED",
+      `Failed to fetch ${url}: ${(err as Error).message}`,
+      "Verify the URL is reachable from the machine running the MCP server.",
+      true,
+    );
+  }
+  if (!res.ok) {
+    throw new ImageInputError(
+      "IMAGE_FETCH_FAILED",
+      `Fetch ${url} returned HTTP ${res.status}.`,
+      "Verify the URL returns image bytes (HTTP 200) and is publicly accessible.",
+      true,
+    );
+  }
+  const contentLength = res.headers.get("content-length");
+  if (contentLength) {
+    const n = parseInt(contentLength, 10);
+    if (Number.isFinite(n) && n > MAX_IMAGE_BYTES) {
+      throw new ImageInputError(
+        "IMAGE_TOO_LARGE",
+        `Image at ${url} is ${n} bytes (Content-Length); max ${MAX_IMAGE_BYTES} (10 MB).`,
+        "Compress the image below 10 MB before uploading.",
+        false,
+      );
+    }
+  }
+  const arrayBuf = await res.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+function decodeImageData(b64: string): Buffer {
+  const stripped = b64.startsWith("data:")
+    ? b64.replace(/^data:[^;]*;base64,/, "")
+    : b64;
+  const buf = Buffer.from(stripped, "base64");
+  if (buf.length === 0) {
+    throw new ImageInputError(
+      "INVALID_ARGUMENTS",
+      "image_data decoded to 0 bytes (not valid base64, or empty).",
+      "Pass non-empty base64-encoded image bytes (no data: URI prefix).",
+      false,
+    );
+  }
+  return buf;
+}
+
+async function loadAndValidateImage(args: {
+  image_path?: string;
+  image_url?: string;
+  image_data?: string;
+}): Promise<{
+  base64: string;
+  format: ImageFormat;
+  sizeBytes: number;
+  source: "path" | "url" | "data";
+}> {
+  const provided: Array<"path" | "url" | "data"> = [];
+  if (args.image_path) provided.push("path");
+  if (args.image_url) provided.push("url");
+  if (args.image_data) provided.push("data");
+
+  if (provided.length === 0) {
+    throw new ImageInputError(
+      "INVALID_ARGUMENTS",
+      "Exactly one of image_path, image_url, or image_data must be provided.",
+      "Pass image_path (absolute filesystem path) for local files, image_url for a public http(s) URL, or image_data (base64) for programmatic callers.",
+      false,
+    );
+  }
+  if (provided.length > 1) {
+    throw new ImageInputError(
+      "INVALID_ARGUMENTS",
+      `Only one image source allowed; got ${provided.length}: ${provided.map((p) => "image_" + p).join(", ")}.`,
+      "Provide exactly one of image_path, image_url, or image_data.",
+      false,
+    );
+  }
+
+  let buf: Buffer;
+  const source = provided[0];
+  if (source === "path") buf = await readImageFromPath(args.image_path!);
+  else if (source === "url") buf = await fetchImageFromUrl(args.image_url!);
+  else buf = decodeImageData(args.image_data!);
+
+  if (buf.length > MAX_IMAGE_BYTES) {
+    throw new ImageInputError(
+      "IMAGE_TOO_LARGE",
+      `Image is ${buf.length} bytes; max ${MAX_IMAGE_BYTES} (10 MB).`,
+      "Compress the image below 10 MB before uploading.",
+      false,
+    );
+  }
+
+  const format = sniffImageFormat(buf);
+  if (!format) {
+    throw new ImageInputError(
+      "IMAGE_INVALID_FORMAT",
+      "Image bytes do not match PNG, JPEG, WebP, or GIF magic bytes.",
+      "Re-export the image as PNG, JPEG, WebP, or GIF and try again.",
+      false,
+    );
+  }
+
+  return {
+    base64: buf.toString("base64"),
+    format,
+    sizeBytes: buf.length,
+    source,
+  };
+}
 
 const StepTypeEnum = z.enum(["message", "quiz", "exercise"]);
 const ButtonActionEnum = z.enum(["next", "help", "skip", "custom", "branch"]);
@@ -263,18 +446,37 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
     {
       name: "flowlearn_flow_step_upload_image",
       description:
-        "Upload an image for a flow step. Pass the file as base64-encoded bytes in `image_data` (no data: URI prefix).\n\n" +
+        "Upload an image for a flow step. Provide EXACTLY ONE source:\n" +
+        "  • image_path — absolute filesystem path (PREFERRED for Claude Code; the MCP server reads and base64-encodes the file)\n" +
+        "  • image_url — public http(s) URL (the MCP server fetches the bytes)\n" +
+        "  • image_data — base64-encoded bytes, no data: URI prefix (programmatic callers)\n\n" +
         "When to use: attach an illustration, screenshot, or photo to an existing step.\n" +
         "When NOT to use: video — use flowlearn_flow_step_update with video_url instead.\n\n" +
-        "Accepted formats: PNG, JPEG, WebP, GIF. Max 10 MB. The server compresses to WebP and returns the public URL.\n\n" +
-        'Example call: { "flow_step_id": "stp_abc", "image_data": "<base64>" }\n\n' +
-        "Errors: FLOWLEARN_API_400 on too-large or invalid image; FLOWLEARN_API_404 on bad flow_step_id.",
+        "Why image_path is preferred from Claude Code: a pasted screenshot reaches the model only as a multimodal image block — the model cannot serialize it back to base64 to fit the image_data parameter. Save the screenshot to disk (Snipping Tool / Win+Shift+S → save / drag-drop a file into the terminal) and pass its absolute path here.\n\n" +
+        "Accepted formats: PNG, JPEG, WebP, GIF (sniffed by magic bytes). Max 10 MB. The Flowlearn server compresses to WebP and returns the public URL.\n\n" +
+        'Example call: { "flow_step_id": "stp_abc", "image_path": "C:\\\\Users\\\\me\\\\screenshot.png" }\n\n' +
+        "Errors: INVALID_ARGUMENTS (zero or multiple sources, relative path, bad URL scheme); IMAGE_TOO_LARGE (>10 MB); IMAGE_INVALID_FORMAT (not PNG/JPEG/WebP/GIF); IMAGE_READ_FAILED (path unreadable); IMAGE_FETCH_FAILED (URL unreachable or non-2xx); FLOWLEARN_API_400 on API rejection; FLOWLEARN_API_404 on bad flow_step_id.",
       inputSchema: {
         flow_step_id: z.string().min(1),
+        image_path: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Absolute filesystem path to a PNG/JPEG/WebP/GIF file. Preferred for Claude Code users.",
+          ),
+        image_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Public http(s) URL the MCP server fetches."),
         image_data: z
           .string()
           .min(1)
-          .describe("Base64-encoded image bytes (no data: URI prefix)"),
+          .optional()
+          .describe(
+            "Base64-encoded image bytes (no data: URI prefix). Use only if you already have the bytes in memory; Claude Code typically cannot produce this from a paste.",
+          ),
       },
       outputSchema: z.object({
         entity: z.object({ image_url: z.string().optional() }).passthrough(),
@@ -288,14 +490,33 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         idempotentHint: false,
         openWorldHint: true,
       },
-      handler: async ({ flow_step_id, image_data }) => {
+      handler: async ({ flow_step_id, image_path, image_url, image_data }) => {
+        let prepared;
+        try {
+          prepared = await loadAndValidateImage({
+            image_path: image_path as string | undefined,
+            image_url: image_url as string | undefined,
+            image_data: image_data as string | undefined,
+          });
+        } catch (err) {
+          if (err instanceof ImageInputError) {
+            return errorResult({
+              code: err.code,
+              message: err.message,
+              suggestion: err.suggestion,
+              retriable: err.retriable,
+            });
+          }
+          throw err;
+        }
+
         const data = await client.request<Record<string, unknown>>(
           `/api/flow-steps/${flow_step_id}/image`,
-          { method: "POST", body: { imageData: image_data } },
+          { method: "POST", body: { imageData: prepared.base64 } },
         );
         return entityResult({
           entity: data,
-          summary: `Uploaded image for flow step ${flow_step_id}. URL: ${data.image_url ?? "(returned in entity)"}.`,
+          summary: `Uploaded ${prepared.format} image (${prepared.sizeBytes} bytes, source=image_${prepared.source}) for flow step ${flow_step_id}. URL: ${data.image_url ?? "(returned in entity)"}.`,
         });
       },
     },
