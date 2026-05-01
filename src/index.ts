@@ -3,7 +3,14 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  CompleteRequestSchema,
+  GetPromptRequestSchema,
+  ListPromptsRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ListResourcesRequestSchema,
   ListToolsRequestSchema,
+  ReadResourceRequestSchema,
+  SetLevelRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
@@ -18,6 +25,25 @@ import { buildFlowStepTools } from "./tools/flowStep.js";
 import { buildConnectionTools } from "./tools/connection.js";
 import { buildSetupTools } from "./tools/setup.js";
 import { buildHelpTools } from "./tools/help.js";
+import {
+  RESOURCE_TEMPLATES,
+  ResourceNotFoundError,
+  completeResourceArgument,
+  listConcreteResources,
+  readResource,
+} from "./resources.js";
+import { PROMPTS, PromptNotFoundError, getPrompt } from "./prompts.js";
+
+const SERVER_INSTRUCTIONS = `flowlearn-mcp wraps the flowlearn.io course-creation API. Conventions:
+
+- Tools are flowlearn_<resource>_<verb> snake_case. Hierarchy: tenant → course → module → lesson → flow_step (+ connection edges).
+- Mutations return { entity, summary, url?, resource_uri?, next_actions? }; lists return { items, total, next_cursor, has_more, summary }.
+- Errors are structured: { code, message, suggestion?, retriable, details? }.
+- Every *_create accepts client_request_id for idempotent retries; every destructive tool accepts dry_run=true.
+- Resources: flowlearn://course/{id}, flowlearn://lesson/{id}, flowlearn://docs/{topic}, flowlearn://tenant/current.
+- Prompts (slash commands): scaffold_course, audit_course, import_markdown.
+- Start a fresh session with flowlearn_setup_status (or read flowlearn://tenant/current).
+- Server-side AI is intentionally NOT exposed — the agent generates content; this server only persists.`;
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -36,9 +62,20 @@ async function main(): Promise<void> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: "flowlearn-mcp", version: "0.2.0" },
-    { capabilities: { tools: {} } },
+    { name: "flowlearn-mcp", version: "0.3.0" },
+    {
+      capabilities: {
+        tools: {},
+        resources: { subscribe: false, listChanged: false },
+        prompts: { listChanged: false },
+        logging: {},
+        completions: {},
+      },
+      instructions: SERVER_INSTRUCTIONS,
+    },
   );
+
+  // --- Tools -----------------------------------------------------------
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: tools.map((t) => {
@@ -124,11 +161,79 @@ async function main(): Promise<void> {
     }
   });
 
+  // --- Resources -------------------------------------------------------
+
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: listConcreteResources(),
+  }));
+
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+    resourceTemplates: RESOURCE_TEMPLATES,
+  }));
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+    try {
+      const contents = await readResource(client, req.params.uri);
+      return { contents };
+    } catch (err) {
+      if (err instanceof ResourceNotFoundError) {
+        throw new Error(`Resource not found: ${err.message}`);
+      }
+      throw err;
+    }
+  });
+
+  // --- Prompts ---------------------------------------------------------
+
+  server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+    prompts: PROMPTS,
+  }));
+
+  server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+    try {
+      const args = (req.params.arguments ?? {}) as Record<string, string | undefined>;
+      return getPrompt(req.params.name, args);
+    } catch (err) {
+      if (err instanceof PromptNotFoundError) {
+        throw new Error(err.message);
+      }
+      throw err;
+    }
+  });
+
+  // --- Completion ------------------------------------------------------
+
+  server.setRequestHandler(CompleteRequestSchema, async (req) => {
+    const ref = req.params.ref;
+    const arg = req.params.argument;
+    if (ref.type === "ref/resource") {
+      const result = await completeResourceArgument(
+        client,
+        ref.uri,
+        arg.name,
+        arg.value ?? "",
+      );
+      return { completion: { values: result.values, total: result.total, hasMore: result.hasMore } };
+    }
+    // ref/prompt or unknown — no completion data wired yet.
+    return { completion: { values: [], hasMore: false } };
+  });
+
+  // --- Logging ---------------------------------------------------------
+
+  // Honor logging/setLevel but don't currently filter — the server itself
+  // does not emit verbose logs to the client. Declared for capability
+  // completeness; we'll wire actual structured emission as long-running ops
+  // arrive in Tier 2.
+  server.setRequestHandler(SetLevelRequestSchema, async () => ({}));
+
+  // --- Connect ---------------------------------------------------------
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
   process.stderr.write(
-    `flowlearn-mcp v0.2.0 ready: ${tools.length} tools, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
+    `flowlearn-mcp v0.3.0 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
   );
 }
 

@@ -109,6 +109,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
           entity,
           summary: `Lesson '${entity.title}' (id=${id}), flow_completed=${entity.flow_completed ?? false}.`,
           url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "lesson", id),
+          resource_uri: `flowlearn://lesson/${id}`,
           next_actions: [
             `flowlearn_flow_step_list with lesson_id="${id}" to see the flow`,
             `flowlearn_lesson_update with lesson_id="${id}" + flow_completed=true once steps are done`,
@@ -157,6 +158,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
           entity,
           summary: `Created lesson '${entity.title}' (id=${id}) in module ${module_id}.`,
           url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "lesson", id),
+          resource_uri: `flowlearn://lesson/${id}`,
           next_actions: [
             `flowlearn_flow_step_create with lesson_id="${id}" + is_starting_step=true to add the entry step`,
           ],
@@ -202,6 +204,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
           entity,
           summary: `Updated lesson '${entity.title}' (id=${id}).`,
           url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "lesson", id),
+          resource_uri: `flowlearn://lesson/${id}`,
         });
       },
     },

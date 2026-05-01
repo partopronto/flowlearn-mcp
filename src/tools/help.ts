@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { entityResult, type ToolDef } from "./common.js";
 
-const TOPICS = {
+export const HELP_TOPICS = {
   overview: `# Flowlearn MCP — overview
 
 Hierarchy (top-down):
@@ -21,6 +21,17 @@ Cross-cutting features:
 - Pagination: every *_list takes { limit, cursor, response_format } where format=concise → {id, title} only.
 - Idempotency: every *_create takes optional client_request_id; same key → cached result.
 - Dry-run: every destructive tool takes optional dry_run=true to preview without mutating.
+
+Resources (alongside tools):
+- flowlearn://course/{id}      full course tree as JSON
+- flowlearn://lesson/{id}      lesson + flow steps + connections
+- flowlearn://docs/{topic}     overview / publishing / enums / troubleshooting
+- flowlearn://tenant/current   active tenant identity + memberships
+
+Prompts (slash commands in Claude Code):
+- /flowlearn:scaffold-course        Build a course from a free-form outline
+- /flowlearn:audit-course           Lint a course for publish-blockers
+- /flowlearn:import-markdown        Convert a markdown doc to a course tree
 
 Authoring quickstart:
   1. flowlearn_setup_status                                    → orient
@@ -70,6 +81,8 @@ FLOWLEARN_API_5xx  → Flowlearn upstream issue. Retriable=true; back off and re
 Tools renamed in v0.2.0: dotted names ('course.list') → snake_case ('flowlearn_course_list'). camelCase params ('flowStepId') → snake_case ('flow_step_id'). Existing scripts using dotted names will get UNKNOWN_TOOL.`,
 };
 
+export type HelpTopic = keyof typeof HELP_TOPICS;
+
 const TopicEnum = z.enum([
   "overview",
   "publishing",
@@ -82,7 +95,7 @@ export function buildHelpTools(): ToolDef[] {
     {
       name: "flowlearn_help",
       description:
-        "Self-documenting reference: data model, hierarchy, enums, publishing rules, troubleshooting, and a worked authoring example.\n\n" +
+        "Self-documenting reference: data model, hierarchy, enums, publishing rules, troubleshooting, and a worked authoring example. Same content is also exposed as resources at flowlearn://docs/{topic}.\n\n" +
         "When to use: at session start (load 'overview' once instead of guessing tool semantics); when you hit an unfamiliar error code; before publishing.\n" +
         "When NOT to use: as a substitute for inspecting actual data — call the *_list and *_get tools for current state.\n\n" +
         "Topics: overview (default), publishing, enums, troubleshooting.\n\n" +
@@ -110,8 +123,8 @@ export function buildHelpTools(): ToolDef[] {
         openWorldHint: false,
       },
       handler: async ({ topic }) => {
-        const t = (topic as keyof typeof TOPICS | undefined) ?? "overview";
-        const markdown = TOPICS[t];
+        const t = (topic as HelpTopic | undefined) ?? "overview";
+        const markdown = HELP_TOPICS[t];
         return entityResult({
           entity: { topic: t, markdown },
           summary: `flowlearn_help: ${t} (${markdown.split("\n").length} lines).`,

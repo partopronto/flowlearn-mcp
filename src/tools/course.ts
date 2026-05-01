@@ -108,6 +108,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
           entity,
           summary: `Course '${entity.title}' (id=${id}), status=${entity.status}.`,
           url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id),
+          resource_uri: `flowlearn://course/${id}`,
           next_actions: [
             `flowlearn_module_list with course_id="${id}" to list modules`,
             `flowlearn_course_update with course_id="${id}" to edit metadata`,
@@ -156,6 +157,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
           entity,
           summary: `Created draft course '${entity.title}' (id=${id}).`,
           url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id),
+          resource_uri: `flowlearn://course/${id}`,
           next_actions: [
             `flowlearn_module_create with course_id="${id}" to add the first module`,
             `flowlearn_course_update with course_id="${id}" to set goal/tone`,
@@ -218,6 +220,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
             ? `Update returned requiresConfirmation — re-call with force_publish=true to override.`
             : `Updated course '${entity.title}' (id=${id}), status=${status}.`,
           url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id),
+          resource_uri: `flowlearn://course/${id}`,
           next_actions: data.requiresConfirmation
             ? [`flowlearn_course_update again with force_publish=true`]
             : status === "published"

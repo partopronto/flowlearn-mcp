@@ -26,8 +26,12 @@ export type ToolDef = {
   handler: (args: Record<string, unknown>) => Promise<ToolResult>;
 };
 
+export type ToolContent =
+  | { type: "text"; text: string }
+  | { type: "resource_link"; uri: string; name?: string; description?: string; mimeType?: string };
+
 export type ToolResult = {
-  content: Array<{ type: "text"; text: string }>;
+  content: ToolContent[];
   /** Structured JSON payload — modern clients prefer this; we emit it
    *  alongside the text rendering for backwards compat. */
   structuredContent?: Record<string, unknown>;
@@ -39,6 +43,10 @@ export type EntityEnvelope<T> = {
   entity: T;
   summary: string;
   url?: string;
+  /** flowlearn:// URI that can be read as a resource. When set, the tool
+   *  result also includes a resource_link content block so MCP clients
+   *  that support it can dereference without an extra tool call. */
+  resource_uri?: string;
   next_actions?: string[];
 };
 
@@ -69,9 +77,22 @@ export function structured<T extends Record<string, unknown>>(value: T): ToolRes
   };
 }
 
-/** Wrap an entity as the standard envelope. */
+/** Wrap an entity as the standard envelope. If resource_uri is set, also
+ *  attach a resource_link content block so MCP clients that support it can
+ *  dereference the entity as a resource without spending a tool call. */
 export function entityResult<T>(envelope: EntityEnvelope<T>): ToolResult {
-  return structured(envelope as unknown as Record<string, unknown>);
+  const value = envelope as unknown as Record<string, unknown>;
+  const content: ToolContent[] = [
+    { type: "text", text: JSON.stringify(value, null, 2) },
+  ];
+  if (envelope.resource_uri) {
+    content.push({
+      type: "resource_link",
+      uri: envelope.resource_uri,
+      name: envelope.summary,
+    });
+  }
+  return { content, structuredContent: value };
 }
 
 /** Wrap a list as the standard envelope. */

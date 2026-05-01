@@ -102,6 +102,11 @@ class McpClient:
             "method": "notifications/initialized",
         })
 
+    def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        """Send any MCP method (resources/list, prompts/get, completion/complete, ...)
+        and return the parsed result. Raises McpServerError on protocol errors."""
+        return self._request(method, params)
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """Invoke a tool. Returns the parsed JSON the tool produced.
 

@@ -4,7 +4,9 @@ MCP server that exposes Flowlearn course-creation actions to Claude Code (termin
 
 ## What it does
 
-Surfaces 30 tools that mirror what a tenant admin can do in the course-creation UI, plus a help/reference tool and three setup helpers callable from inside a Claude session. Server-side AI is intentionally not exposed (no `createWithAI`, no `improve`, no interview tools); the calling agent generates content and persists it via the dedicated tools.
+A full MCP surface — 30 tools, 3 resource templates, 3 user-invokable prompts (slash commands), completion, and structured logging. Mirrors what a tenant admin can do in the course-creation UI. Server-side AI is intentionally not exposed (no `createWithAI`, no `improve`, no interview tools); the calling agent generates content and persists it via the dedicated tools.
+
+### Tools (30)
 
 - **Help (1)** — `flowlearn_help`
 - **Setup (3)** — `flowlearn_setup_status`, `flowlearn_setup_switch_tenant`, `flowlearn_setup_update`
@@ -13,6 +15,25 @@ Surfaces 30 tools that mirror what a tenant admin can do in the course-creation 
 - **Lesson (5)** — `flowlearn_lesson_list`, `flowlearn_lesson_get`, `flowlearn_lesson_create`, `flowlearn_lesson_update`, `flowlearn_lesson_delete`
 - **FlowStep (7)** — `flowlearn_flow_step_list`, `flowlearn_flow_step_create`, `flowlearn_flow_step_update`, `flowlearn_flow_step_delete`, `flowlearn_flow_step_reorder`, `flowlearn_flow_step_upload_image`, `flowlearn_flow_step_delete_image`
 - **Connection (4)** — `flowlearn_connection_list`, `flowlearn_connection_add`, `flowlearn_connection_replace_all`, `flowlearn_connection_clear`
+
+### Resources
+
+Cheap reads with no tool-call round trip; supports completion on `{id}`/`{topic}`.
+
+- `flowlearn://course/{id}` — full course tree as JSON
+- `flowlearn://lesson/{id}` — lesson + flow steps + connections as one JSON
+- `flowlearn://docs/{topic}` — `overview` / `publishing` / `enums` / `troubleshooting` (markdown)
+- `flowlearn://tenant/current` — active tenant identity + memberships
+
+Mutating tools also embed a `resource_link` content block in their response (`course_create` → `flowlearn://course/<new_id>`) so clients that support it can dereference without a follow-up call.
+
+### Prompts (slash commands)
+
+In Claude Code, type `/` and pick under the `flowlearn` group:
+
+- `scaffold_course` — Build a course from a free-form outline. Args: `outline`, `title?`, `language?`.
+- `audit_course` — Lint a course for publish-blockers. Args: `course_id`.
+- `import_markdown` — Convert a markdown doc to a course tree. Args: `markdown`, `title_override?`.
 
 The base URL is hardcoded to `https://flowlearn.io`. Delete and replace-all tools are always exposed but support `dry_run: true` for previews.
 
