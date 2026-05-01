@@ -48,7 +48,8 @@ def test_outline_apply_dry_run_returns_plan_no_mutation(mcp: McpClient) -> None:
 
     assert resp["summary"].startswith("[dry-run]")
     stats = resp["entity"]["stats"]
-    assert stats == {"modules": 1, "lessons": 1, "flow_steps": 2, "connections": 1}
+    # 2-step lesson → 1 chain edge (step0→step1) + 1 terminal (step1→null) = 2.
+    assert stats == {"modules": 1, "lessons": 1, "flow_steps": 2, "connections": 2}
     # The course in the response is the INPUT shape, not a server response;
     # there should be no `id` field because nothing was created.
     assert "id" not in resp["entity"]["course"]
@@ -66,7 +67,8 @@ def test_outline_apply_then_lint_then_cleanup(mcp: McpClient) -> None:
         "modules": 1,
         "lessons": 1,
         "flow_steps": 2,
-        "connections": 1,
+        # 1 chain edge + 1 terminal "Complete lesson" button = 2.
+        "connections": 2,
     }
     assert create_resp["entity"]["flow_completed_marked"] is True
     assert create_resp["entity"]["published"] is False

@@ -66,7 +66,7 @@ async function main(): Promise<void> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: "flowlearn-mcp", version: "0.4.1" },
+    { name: "flowlearn-mcp", version: "0.4.2" },
     {
       capabilities: {
         tools: {},
@@ -237,7 +237,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   process.stderr.write(
-    `flowlearn-mcp v0.4.1 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
+    `flowlearn-mcp v0.4.2 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
   );
 }
 

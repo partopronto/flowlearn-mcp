@@ -124,7 +124,7 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
         "When to use: scaffolding a NEW course from a structured outline the agent has already produced. Standard happy path for /flowlearn:scaffold_course.\n" +
         "When NOT to use: editing an existing course (use the per-entity update/create tools); when input is unstructured prose (parse first, then call this).\n\n" +
         "Atomicity: if any sub-call fails and rollback_on_error=true (default), the partially-created course is deleted via cascade. Not a true DB transaction — readers may briefly see partial state — but recovery is automatic.\n\n" +
-        "Connections default: if a lesson omits `connections`, steps are wired in a linear chain with 'Next' buttons. To override (branching, terminal buttons, multi-button steps), supply explicit connections referencing step indices into the lesson's `steps` array.\n\n" +
+        "Connections default: if a lesson omits `connections`, steps are wired in a linear chain with 'Next' buttons, PLUS a terminal 'Complete lesson' button on the last step (to_step_id=null) — without that terminal, the lesson's progress meter never reaches 100%. To override (branching, custom terminal text, multi-button steps), supply explicit connections referencing step indices into the lesson's `steps` array.\n\n" +
         "Starting step: the first step in each lesson auto-gets is_starting_step=true unless one of the steps has it set explicitly.\n\n" +
         "Idempotent retry: pass client_request_id; same key on retry returns cached result without re-creating.\n\n" +
         "Dry-run: pass dry_run=true to validate the structure and return the plan WITHOUT mutating.\n\n" +
@@ -412,11 +412,25 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
 
 function defaultLinearChain(stepCount: number): z.infer<typeof ConnectionInput>[] {
   const conns: z.infer<typeof ConnectionInput>[] = [];
+  // Chain consecutive steps with "Next" buttons.
   for (let i = 0; i < stepCount - 1; i++) {
     conns.push({
       from_index: i,
       to_index: i + 1,
       button_text: "Next",
+      button_action: "next",
+      button_order: 1,
+    });
+  }
+  // Terminal button on the last step. Without this, the last step has no
+  // outgoing edge and flowlearn's progress meter never reaches 100% — the
+  // lesson appears permanently incomplete. The button has to_step_id=null
+  // (terminal); clicking it registers completion.
+  if (stepCount > 0) {
+    conns.push({
+      from_index: stepCount - 1,
+      to_index: null,
+      button_text: "Complete lesson",
       button_action: "next",
       button_order: 1,
     });

@@ -195,6 +195,46 @@ export function buildCourseLintTools(client: FlowlearnClient): ToolDef[] {
               }
             }
 
+            // Completion check: at least one step must have a terminal
+            // outgoing connection (to_step_id=null) — without it, progress
+            // never reaches 100% even if every step is reached. Steps with
+            // zero outgoing connections of any kind are also problematic
+            // because clicking through them never registers a "next" event.
+            const stepsWithAnyOutgoing = new Set<string>();
+            const stepsWithTerminal = new Set<string>();
+            for (const s of steps) {
+              const conns = (s.connections as Record<string, unknown>[] | undefined) ?? [];
+              if (conns.length > 0) stepsWithAnyOutgoing.add(String(s.id));
+              if (conns.some((c) => c.to_step_id === null)) {
+                stepsWithTerminal.add(String(s.id));
+              }
+            }
+            if (stepsWithTerminal.size === 0) {
+              issues.push({
+                severity: "warning",
+                code: "NO_TERMINAL_BUTTON",
+                message: `Lesson '${lessonTitle}' has no terminal connection (to_step_id=null). Progress cannot reach 100% — learners get stuck on the last step with no completion button.`,
+                fix_hint:
+                  "Call flowlearn_connection_add on the LAST step in this lesson with { to_step_id: null, button_text: \"Complete lesson\", button_order: 1 }.",
+                location: { lesson_id: lessonId },
+              });
+            }
+            // Steps with zero outgoing connections that are also NOT the
+            // terminal-button-bearing step (i.e., real dead ends).
+            for (const s of steps) {
+              const sid = String(s.id);
+              if (!stepsWithAnyOutgoing.has(sid)) {
+                issues.push({
+                  severity: "warning",
+                  code: "STEP_HAS_NO_OUTGOING",
+                  message: `Step '${String(s.title ?? "(untitled)")}' has no outgoing connection — clicking through it registers nothing.`,
+                  fix_hint:
+                    "Add a connection via flowlearn_connection_add. For the lesson's last step, use to_step_id=null + button_text=\"Complete lesson\".",
+                  location: { flow_step_id: sid, lesson_id: lessonId },
+                });
+              }
+            }
+
             // Reachability BFS from starting step.
             if (starters.length === 1) {
               const start = starters[0];
