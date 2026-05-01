@@ -69,10 +69,30 @@ def test_read_unknown_topic_errors(mcp: McpClient) -> None:
 # -------------------------------------------------------------------------
 
 def test_prompts_list(mcp: McpClient) -> None:
-    """prompts/list must surface the 3 slash-command prompts."""
+    """prompts/list must surface the 4 slash-command prompts."""
     resp = mcp.request("prompts/list")
     names = {p["name"] for p in resp["prompts"]}
-    assert names == {"scaffold_course", "audit_course", "import_markdown"}
+    assert names == {"scaffold_course", "audit_course", "import_markdown", "author_review"}
+
+
+def test_prompt_get_author_review(mcp: McpClient) -> None:
+    """prompts/get author_review must echo the course_id into the rendered message."""
+    resp = mcp.request("prompts/get", {
+        "name": "author_review",
+        "arguments": {"course_id": "crs_xyz123"},
+    })
+    text = resp["messages"][0]["content"]["text"]
+    assert "crs_xyz123" in text
+    # Must surface every editorial check code so the agent knows what to look for.
+    for code in [
+        "IMAGE_REFERENCE_NO_IMAGE",
+        "QUIZ_ANSWER_LEAKED",
+        "IMAGE_LOOKS_LIKE_AD",
+        "IMAGE_COPYRIGHTED",
+        "MISSING_DESCRIPTION",
+        "LAST_LESSON_NAVIGATION_LOOP",
+    ]:
+        assert code in text, f"author_review prompt missing check code {code}"
 
 
 def test_prompt_get_scaffold_course(mcp: McpClient) -> None:

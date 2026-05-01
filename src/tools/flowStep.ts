@@ -18,6 +18,45 @@ import {
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
+/**
+ * Hosts that reliably serve license-clean (CC / public domain / royalty-free)
+ * imagery. URLs from any other host trigger a soft `warnings` advisory in the
+ * upload response — agents are expected to reconsider before publishing.
+ * Adding hosts here is a deliberate trust signal; don't extend casually.
+ */
+const CC_LICENSED_HOSTS: ReadonlySet<string> = new Set([
+  // Wikimedia family — CC-BY-SA / public domain by policy
+  "upload.wikimedia.org",
+  "commons.wikimedia.org",
+  // Unsplash / Pexels / Pixabay — free-for-commercial-use stock
+  "images.unsplash.com",
+  "images.pexels.com",
+  "cdn.pixabay.com",
+  // US-government public-domain sources commonly used in finance/economics
+  "www.bls.gov",
+  "bls.gov",
+  "www.federalreserve.gov",
+  "federalreserve.gov",
+  "fred.stlouisfed.org",
+  "www.sec.gov",
+  "sec.gov",
+]);
+
+function classifyImageUrlHost(url: string): {
+  hostname: string;
+  trusted: boolean;
+} | null {
+  try {
+    const u = new URL(url);
+    return {
+      hostname: u.hostname,
+      trusted: CC_LICENSED_HOSTS.has(u.hostname),
+    };
+  } catch {
+    return null;
+  }
+}
+
 type ImageFormat = "png" | "jpeg" | "gif" | "webp";
 
 class ImageInputError extends Error {
@@ -454,6 +493,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         "When NOT to use: video — use flowlearn_flow_step_update with video_url instead.\n\n" +
         "Why image_path is preferred from Claude Code: a pasted screenshot reaches the model only as a multimodal image block — the model cannot serialize it back to base64 to fit the image_data parameter. Save the screenshot to disk (Snipping Tool / Win+Shift+S → save / drag-drop a file into the terminal) and pass its absolute path here.\n\n" +
         "Accepted formats: PNG, JPEG, WebP, GIF (sniffed by magic bytes). Max 10 MB. The Flowlearn server compresses to WebP and returns the public URL.\n\n" +
+        "License advisory (image_url path only): when image_url's host isn't on the known-CC allowlist (upload.wikimedia.org, images.unsplash.com, images.pexels.com, cdn.pixabay.com, public-domain US gov sites), the response includes a `warnings` array. The upload still succeeds — but the agent should pause and verify the license before publishing, or replace the image with a CC-clean alternative. Hosts NOT on the allowlist are not blocked, but commercial-publisher imagery has bitten this MCP repeatedly.\n\n" +
         'Example call: { "flow_step_id": "stp_abc", "image_path": "C:\\\\Users\\\\me\\\\screenshot.png" }\n\n' +
         "Errors: INVALID_ARGUMENTS (zero or multiple sources, relative path, bad URL scheme); IMAGE_TOO_LARGE (>10 MB); IMAGE_INVALID_FORMAT (not PNG/JPEG/WebP/GIF); IMAGE_READ_FAILED (path unreadable); IMAGE_FETCH_FAILED (URL unreachable or non-2xx); FLOWLEARN_API_400 on API rejection; FLOWLEARN_API_404 on bad flow_step_id.",
       inputSchema: {
@@ -514,9 +554,32 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
           `/api/flow-steps/${flow_step_id}/image`,
           { method: "POST", body: { imageData: prepared.base64 } },
         );
+
+        // Soft license advisory: when the image came from a URL whose host
+        // isn't on the known-CC allowlist, surface a warning. Doesn't block
+        // — the agent decides whether to keep or replace before publishing.
+        const warnings: string[] = [];
+        if (prepared.source === "url" && image_url) {
+          const cls = classifyImageUrlHost(image_url as string);
+          if (cls && !cls.trusted) {
+            warnings.push(
+              `Image source host '${cls.hostname}' is NOT on the known-CC allowlist ` +
+                `(upload.wikimedia.org, images.unsplash.com, images.pexels.com, ` +
+                `cdn.pixabay.com, public-domain US gov sites). The image uploaded ` +
+                `successfully, but its license is unverified. Common pitfall: ` +
+                `commercial publisher pages (Fidelity, Britannica, StockCharts, ` +
+                `Investopedia, TradingView, *.gitbook.io) and scraped marketing ` +
+                `graphics. Before publishing, verify the source's license, ` +
+                `or replace via flowlearn_flow_step_delete_image + a CC-clean ` +
+                `re-upload (Wikimedia Commons is the safest first stop).`,
+            );
+          }
+        }
+
         return entityResult({
           entity: data,
-          summary: `Uploaded ${prepared.format} image (${prepared.sizeBytes} bytes, source=image_${prepared.source}) for flow step ${flow_step_id}. URL: ${data.image_url ?? "(returned in entity)"}.`,
+          summary: `Uploaded ${prepared.format} image (${prepared.sizeBytes} bytes, source=image_${prepared.source}) for flow step ${flow_step_id}. URL: ${data.image_url ?? "(returned in entity)"}.${warnings.length > 0 ? " ⚠ See warnings[] for license advisory." : ""}`,
+          warnings: warnings.length > 0 ? warnings : undefined,
         });
       },
     },

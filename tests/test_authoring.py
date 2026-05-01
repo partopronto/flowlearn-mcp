@@ -114,3 +114,53 @@ def test_outline_apply_invalid_outline_rejects(mcp: McpClient) -> None:
     }
     with pytest.raises(McpToolError):
         mcp.call_tool("flowlearn_course_outline_apply", bad)
+
+
+def test_export_outline_roundtrips(mcp: McpClient) -> None:
+    """Build a course via outline_apply, export it, verify the export shape
+    matches outline_apply's input contract. Real round-trip safety net."""
+    payload = _outline(f"EXPORT-{dt.datetime.now(dt.timezone.utc).isoformat()}")
+    create_resp = mcp.call_tool("flowlearn_course_outline_apply", payload)
+    course_id = create_resp["entity"]["course"]["id"]
+
+    try:
+        export = mcp.call_tool("flowlearn_course_export_outline", {"course_id": course_id})
+        outline = export["entity"]["outline"]
+        stats = export["entity"]["stats"]
+
+        # Stats must match what outline_apply created (1 module, 1 lesson,
+        # 2 steps, 2 connections — chain + terminal).
+        assert stats == {"modules": 1, "lessons": 1, "flow_steps": 2, "connections": 2}
+
+        # The exported outline must mirror the input shape.
+        assert outline["course"]["title"] == payload["course"]["title"]
+        assert outline["course"]["topic"] == payload["course"]["topic"]
+
+        modules = outline["course"]["modules"]
+        assert len(modules) == 1
+        assert modules[0]["title"] == "Module 1"
+
+        lessons = modules[0]["lessons"]
+        assert len(lessons) == 1
+        assert lessons[0]["title"] == "Lesson 1.1"
+        assert lessons[0]["flow_completed"] is True  # default mark_flow_completed=true
+
+        steps = lessons[0]["steps"]
+        assert len(steps) == 2
+        assert steps[0]["title"] == "Intro"
+        assert steps[0]["content"] == "Welcome."
+        assert steps[0]["is_starting_step"] is True
+
+        # Connections must be position-based, not id-based.
+        conns = lessons[0]["connections"]
+        assert len(conns) == 2
+        # Chain edge: step 0 → step 1.
+        chain = next(c for c in conns if c["to_index"] == 1)
+        assert chain["from_index"] == 0
+        assert chain["button_text"] == "Next"
+        # Terminal: step 1 → null.
+        terminal = next(c for c in conns if c["to_index"] is None)
+        assert terminal["from_index"] == 1
+        assert terminal["button_text"] == "Complete lesson"
+    finally:
+        mcp.call_tool("flowlearn_course_delete", {"course_id": course_id})

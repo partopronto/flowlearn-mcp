@@ -83,7 +83,20 @@ const IMPORT_MARKDOWN: PromptDef = {
   ],
 };
 
-export const PROMPTS: PromptDef[] = [SCAFFOLD_COURSE, AUDIT_COURSE, IMPORT_MARKDOWN];
+const AUTHOR_REVIEW: PromptDef = {
+  name: "author_review",
+  description:
+    "Editorial pass on an existing flowlearn course. Distinct from flowlearn_course_lint (which checks structure): this catches CONTENT-quality issues — image-references without images, quiz answers leaked in the same step, empty/thin content, missing course description, weak module objectives. Read-only; reports findings with suggested fixes for the user to approve.",
+  arguments: [
+    {
+      name: "course_id",
+      description: "ID of the course to review. Use flowlearn_course_list to find one.",
+      required: true,
+    },
+  ],
+};
+
+export const PROMPTS: PromptDef[] = [SCAFFOLD_COURSE, AUDIT_COURSE, IMPORT_MARKDOWN, AUTHOR_REVIEW];
 
 export function getPrompt(
   name: string,
@@ -96,6 +109,8 @@ export function getPrompt(
       return auditCoursePrompt(args);
     case "import_markdown":
       return importMarkdownPrompt(args);
+    case "author_review":
+      return authorReviewPrompt(args);
     default:
       throw new PromptNotFoundError(`Unknown prompt: ${name}`);
   }
@@ -151,10 +166,11 @@ Steps:
        "course": {
          "title": "...",
          "topic": "...",
+         "description": "<REQUIRED: 1-2 sentence summary of what the learner will be able to do after this course. Empty/missing description shows up as 'No description provided' in the catalog — which looks unfinished.>",
          "language": "${language}",
          "difficulty": "beginner" | "intermediate" | "advanced",
          "modules": [
-           { "title": "...", "objectives": ["..."], "lessons": [
+           { "title": "...", "objectives": ["...measurable, verb-led..."], "lessons": [
              { "title": "...", "steps": [ {"title":"...","content":"...","step_type":"message"}, ... ] }
            ]}
          ]
@@ -162,7 +178,12 @@ Steps:
        "client_request_id": "<random>",
        "dry_run": false
      }
-   Defaults you DO NOT need to set: mark_flow_completed=true (good), publish=false (good — don't auto-publish), connections=linear-chain-with-Next-buttons (good for most outlines).
+   Defaults you DO NOT need to set: mark_flow_completed=true (good), publish=false (good — don't auto-publish), connections=linear-chain-with-Next-buttons-plus-Complete-lesson-terminal (good for most outlines).
+
+   QUIZ PATTERN — read carefully. When you have a quiz step, the question and the answer must NEVER share a single \`content\` field. Use a 2-step pattern:
+     - Step N (step_type: "quiz"): question + multiple-choice options. NO answer text.
+     - Step N+1 (step_type: "message"): "**Answer: <choice>** — <explanation>".
+   The default linear chain still wires them with a "Next" button — the learner clicks Next to reveal. NEVER write "**Answer:** ..." in the same step as the question.
 
 5. **Handle errors.** If outline_apply returned isError, the partial course was rolled back; surface details.partial_tree to the user and propose a fix. STOP — don't proceed.
 
@@ -190,6 +211,7 @@ Steps:
    - The course URL (entity.url from outline_apply).
    - A short summary: N modules, M lessons, K steps, X images attached, Y skipped (with reasons).
    - The lint result (publish_ready, errors, warnings).
+   - **Recommend running /flowlearn:author_review on the course_id for an editorial pass** before publishing — it catches content-quality issues lint can't (image-references-without-images, quiz-answer-leaks, weak module objectives, missing description, etc.).
    - "Want me to publish?" — do NOT auto-publish. Wait for the user to say yes.
 
    On approval: call flowlearn_course_update with status="published" (force_publish=true if lint had warnings but no errors).
@@ -273,6 +295,69 @@ Use client_request_id on every create call to make the operation idempotent. If 
 
   return {
     description: IMPORT_MARKDOWN.description,
+    messages: [{ role: "user", content: { type: "text", text } }],
+  };
+}
+
+function authorReviewPrompt(
+  args: Record<string, string | undefined>,
+): PromptResponse {
+  const courseId = args.course_id ?? "";
+
+  const text = `Editorial review of flowlearn course id="${courseId || "<COURSE_ID>"}".
+
+This is a CONTENT-QUALITY pass. It is DISTINCT from flowlearn_course_lint:
+  - flowlearn_course_lint   → STRUCTURAL: missing terminal buttons, dangling connections, no starting step, etc.
+  - this prompt             → EDITORIAL: text quality, image relevance, quiz design, course metadata
+Both are useful. Run lint first to fix anything broken, then this for polish.
+
+Steps:
+
+1. Read flowlearn://course/${courseId || "<COURSE_ID>"} for the full tree.
+2. For each lesson, read flowlearn://lesson/<lesson_id> to see flow steps + connections.
+
+3. Walk every flow step's content and check for these issues. Report each as:
+   { severity: "high" | "medium" | "low", code: <CODE>, location: { lesson, step }, finding: "...", fix: "<which tool to call, with arg sketch>" }
+
+   **3a. IMAGE_REFERENCE_NO_IMAGE (high)** — content uses phrases like "look at this chart", "see the example", "study this pattern", "as shown below", "this image shows", "in the diagram" — but the step has no image attached (image_url is null/absent). The learner reads text referencing something invisible.
+   Fix: either upload a relevant image via flowlearn_flow_step_upload_image, OR rewrite content via flowlearn_flow_step_update to remove the dangling reference and ask the question without it.
+
+   **3b. QUIZ_ANSWER_LEAKED (high)** — a step has step_type="quiz" AND its content contains the answer in the same field (regex: \`\\*\\*Answer:\` or "Correct answer:" or "The answer is"). The learner sees the answer immediately; the quiz mechanic is broken.
+   Fix: split into 2 steps. Step N stays as the question (remove the answer block); step N+1 becomes a new step_type="message" containing the answer + explanation, with content "**Answer: ...**". Wire them with a connection (e.g., button_text="Reveal answer"). Use flowlearn_flow_step_create + flowlearn_connection_add + flowlearn_flow_step_update on the original.
+
+   **3c. IMAGE_LOOKS_LIKE_AD (high)** — image is on the step, but it appears to be promotional/marketing material rather than educational. Signals: visible watermark URL of an unrelated commercial site, generic "stock-photo" aesthetic with arrows and dollar signs, doesn't actually depict what the step describes, contains a brand logo not relevant to the course.
+   Fix: delete via flowlearn_flow_step_delete_image, then upload a CC-licensed alternative from upload.wikimedia.org / images.unsplash.com / images.pexels.com that actually shows the described concept.
+
+   **3d. IMAGE_COPYRIGHTED (medium)** — image_url host is from a known commercial publisher (fidelity.com, britannica.com, investopedia.com, schwab.com, tradingview.com, stockcharts.com, the bollingerbandspro.com / bollingerbandspro.com / bollingerbands.com family, gitbook.io spaces, etc.). Even if the image renders, it's likely not licensed for this use.
+   Fix: same as 3c — delete + replace with a verified CC source.
+
+   **3e. EMPTY_OR_THIN_CONTENT (medium)** — step content is fewer than 30 characters, or is just a heading with no body. Flag for completion.
+   Fix: flowlearn_flow_step_update with substantive content.
+
+   **3f. EXCESSIVE_CONTENT (low)** — step content exceeds ~600 words. Probably should be split into multiple steps for cognitive load.
+   Fix: split using flowlearn_flow_step_create for the new step + flowlearn_connection_add to wire it in.
+
+   **3g. LAST_LESSON_NAVIGATION_LOOP (medium)** — the very last lesson in the course (last module → last lesson) has a terminal "Complete lesson" button that the platform decorates with a "Next Lesson" CTA. There IS no next lesson, so clicking it loops back to the same page. Confusing dead-end for the learner.
+   Fix: identify the terminal connection on the last step of the last lesson and change button_text via flowlearn_connection_replace_all from "Complete lesson" to "Finish course" or "Return to course menu". Note: the platform's "Next Lesson" CTA may render regardless of the button text — true resolution needs platform support, but a clearer button text mitigates the surprise.
+
+4. Course-level checks:
+   **4a. MISSING_DESCRIPTION (high)** — course.description is empty, null, or "No description provided". The catalog page looks bare.
+   Fix: flowlearn_course_update with a 1-2 sentence description.
+
+   **4b. NO_LANGUAGE (low)** — course.language is null. Fix: flowlearn_course_update with the appropriate ISO code.
+
+   **4c. WEAK_OBJECTIVES (medium)** — module has no objectives, or objectives are vague ("Learn about X"). Good objectives are measurable and start with a verb (Bloom-style: "Identify…", "Compare…", "Apply…").
+   Fix: flowlearn_module_update with content.objectives populated with 2-4 measurable items.
+
+5. Output a structured report:
+   - Top of report: { course_id, total_issues, by_severity: {high, medium, low}, summary }.
+   - Then issues array.
+   - End: top 3 priorities the user should fix first.
+
+DO NOT make any changes. This is read-only. After reporting, ask the user which fixes they want applied. If the course is editorial-clean, say so explicitly.`;
+
+  return {
+    description: AUTHOR_REVIEW.description,
     messages: [{ role: "user", content: { type: "text", text } }],
   };
 }

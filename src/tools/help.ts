@@ -29,9 +29,14 @@ Resources (alongside tools):
 - flowlearn://tenant/current   active tenant identity + memberships
 
 Prompts (slash commands in Claude Code):
-- /flowlearn:scaffold-course        Build a course from a free-form outline
-- /flowlearn:audit-course           Lint a course for publish-blockers
-- /flowlearn:import-markdown        Convert a markdown doc to a course tree
+- /flowlearn:scaffold_course   Build a course from a free-form outline (one-shot)
+- /flowlearn:audit_course      Lint a course for publish-blockers (structural)
+- /flowlearn:import_markdown   Convert a markdown doc to a course tree
+- /flowlearn:author_review     Editorial pass — image-references-without-images, quiz answer leaks, weak descriptions, copyrighted/promotional images, last-lesson navigation loops
+
+Round-trip tools (Tier 3):
+- flowlearn_course_outline_apply  Take a nested outline → builds the entire course in one call
+- flowlearn_course_export_outline Take an existing course_id → returns the same nested-outline shape (round-trip; use for backups, templates, offline edits)
 
 Authoring — fast path (preferred):
   1. flowlearn_setup_status                          → orient

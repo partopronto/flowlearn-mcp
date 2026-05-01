@@ -4,14 +4,14 @@ MCP server that exposes Flowlearn course-creation actions to Claude Code (termin
 
 ## What it does
 
-A full MCP surface — 32 tools, 3 resource templates, 3 user-invokable prompts (slash commands), completion, and structured logging. Mirrors what a tenant admin can do in the course-creation UI. Server-side AI is intentionally not exposed (no `createWithAI`, no `improve`, no interview tools); the calling agent generates content and persists it via the dedicated tools.
+A full MCP surface — 33 tools, 3 resource templates, 4 user-invokable prompts (slash commands), completion, and structured logging. Mirrors what a tenant admin can do in the course-creation UI. Server-side AI is intentionally not exposed (no `createWithAI`, no `improve`, no interview tools); the calling agent generates content and persists it via the dedicated tools.
 
-### Tools (32)
+### Tools (33)
 
 - **Help (1)** — `flowlearn_help`
 - **Setup (3)** — `flowlearn_setup_status`, `flowlearn_setup_switch_tenant`, `flowlearn_setup_update`
 - **Course (5)** — `flowlearn_course_list`, `flowlearn_course_get`, `flowlearn_course_create`, `flowlearn_course_update`, `flowlearn_course_delete`
-- **Course authoring & quality (2)** — `flowlearn_course_outline_apply` (one-shot course creation from a nested outline), `flowlearn_course_lint` (publish-readiness audit)
+- **Course authoring & quality (3)** — `flowlearn_course_outline_apply` (one-shot course creation from a nested outline), `flowlearn_course_lint` (publish-readiness audit), `flowlearn_course_export_outline` (round-trip an existing course back to outline shape — backups, templates, offline edits)
 - **Module (5)** — `flowlearn_module_list`, `flowlearn_module_create`, `flowlearn_module_update`, `flowlearn_module_delete`, `flowlearn_module_reorder`
 - **Lesson (5)** — `flowlearn_lesson_list`, `flowlearn_lesson_get`, `flowlearn_lesson_create`, `flowlearn_lesson_update`, `flowlearn_lesson_delete`
 - **FlowStep (7)** — `flowlearn_flow_step_list`, `flowlearn_flow_step_create`, `flowlearn_flow_step_update`, `flowlearn_flow_step_delete`, `flowlearn_flow_step_reorder`, `flowlearn_flow_step_upload_image`, `flowlearn_flow_step_delete_image`
@@ -35,6 +35,7 @@ In Claude Code, type `/` and pick under the `flowlearn` group:
 - `scaffold_course` — Build a course from a free-form outline. Args: `outline`, `title?`, `language?`.
 - `audit_course` — Lint a course for publish-blockers. Args: `course_id`.
 - `import_markdown` — Convert a markdown doc to a course tree. Args: `markdown`, `title_override?`.
+- `author_review` — Editorial pass on an existing course (image-references-without-images, quiz-answer leaks, copyrighted/promotional images, weak descriptions, last-lesson navigation loops). Args: `course_id`. Read-only — reports findings; you decide what to fix.
 
 The base URL is hardcoded to `https://flowlearn.io`. Delete and replace-all tools are always exposed but support `dry_run: true` for previews.
 
@@ -103,7 +104,7 @@ claude mcp list           # should show 'flowlearn ✓ Connected'
 claude mcp get flowlearn  # shows config including env values
 ```
 
-Inside a Claude Code session, `/mcp` shows the server status and 32 tools. If you change credentials, restart any open session.
+Inside a Claude Code session, `/mcp` shows the server status and 33 tools. If you change credentials, restart any open session.
 
 ### Alternative — manual `claude mcp add`
 
@@ -137,7 +138,7 @@ Add to `claude_desktop_config.json` (Mac: `~/Library/Application Support/Claude/
 }
 ```
 
-Restart Claude Desktop. The 32 tools appear under the `flowlearn` server.
+Restart Claude Desktop. The 33 tools appear under the `flowlearn` server.
 
 ## For Claude / AI agents — how to use this MCP
 

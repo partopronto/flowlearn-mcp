@@ -27,6 +27,7 @@ import { buildSetupTools } from "./tools/setup.js";
 import { buildHelpTools } from "./tools/help.js";
 import { buildCourseOutlineTools } from "./tools/courseOutline.js";
 import { buildCourseLintTools } from "./tools/courseLint.js";
+import { buildCourseExportTools } from "./tools/courseExport.js";
 import {
   RESOURCE_TEMPLATES,
   ResourceNotFoundError,
@@ -57,6 +58,7 @@ async function main(): Promise<void> {
     ...buildCourseTools(client),
     ...buildCourseOutlineTools(client),
     ...buildCourseLintTools(client),
+    ...buildCourseExportTools(client),
     ...buildModuleTools(client),
     ...buildLessonTools(client),
     ...buildFlowStepTools(client),
@@ -66,7 +68,7 @@ async function main(): Promise<void> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: "flowlearn-mcp", version: "0.4.2" },
+    { name: "flowlearn-mcp", version: "0.5.0" },
     {
       capabilities: {
         tools: {},
@@ -237,7 +239,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   process.stderr.write(
-    `flowlearn-mcp v0.4.2 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
+    `flowlearn-mcp v0.5.0 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
   );
 }
 

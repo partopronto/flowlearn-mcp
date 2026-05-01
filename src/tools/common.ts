@@ -48,6 +48,11 @@ export type EntityEnvelope<T> = {
    *  that support it can dereference without an extra tool call. */
   resource_uri?: string;
   next_actions?: string[];
+  /** Soft advisories that don't fail the call but the agent should consider
+   *  before reporting success to the user (e.g. license suspicion on an
+   *  uploaded image). Distinct from `errorResult` which signals an actual
+   *  failure. */
+  warnings?: string[];
 };
 
 /** Standard envelope returned by list tools. */
