@@ -4,20 +4,25 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   CompleteRequestSchema,
+  ErrorCode,
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
   ListResourceTemplatesRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
+  McpError,
   ReadResourceRequestSchema,
-  SetLevelRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
 import { loadConfig } from "./config.js";
 import { FlowlearnClient, FlowlearnApiError } from "./client.js";
-import { errorResult, type ToolDef } from "./tools/common.js";
+import {
+  errorResult,
+  setActiveIdempotencyTenant,
+  type ToolDef,
+} from "./tools/common.js";
 import { buildCourseTools } from "./tools/course.js";
 import { buildModuleTools } from "./tools/module.js";
 import { buildLessonTools } from "./tools/lesson.js";
@@ -52,6 +57,11 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const client = new FlowlearnClient(config);
 
+  // Seed the idempotency-cache tenant scope from the loaded config so the
+  // first mutation of the session is correctly scoped. Subsequent tenant
+  // switches are kept in sync from src/tools/setup.ts.
+  setActiveIdempotencyTenant(config.tenantSlug);
+
   const tools: ToolDef[] = [
     ...buildHelpTools(),
     ...buildSetupTools(client),
@@ -68,13 +78,25 @@ async function main(): Promise<void> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: "flowlearn-mcp", version: "0.5.0" },
+    {
+      name: "flowlearn-mcp",
+      version: "0.5.0",
+      // SDK Implementation schema (BaseMetadataSchema + ImplementationSchema)
+      // accepts title, websiteUrl, description, icons. We populate the polish
+      // fields the SDK exposes today; icons are deferred until we have a
+      // hosted asset URL.
+      title: "Flowlearn",
+      websiteUrl: "https://flowlearn.io",
+    },
     {
       capabilities: {
         tools: {},
         resources: { subscribe: false, listChanged: false },
         prompts: { listChanged: false },
-        logging: {},
+        // Logging capability deferred — will return when long-running ops
+        // actually emit notifications. Declaring an empty `logging: {}` plus
+        // a no-op SetLevel handler advertises a feature we don't back, which
+        // violates no-legacy-no-fallbacks ("Errors Surface" + "One Code Path").
         completions: {},
       },
       instructions: SERVER_INSTRUCTIONS,
@@ -183,7 +205,12 @@ async function main(): Promise<void> {
       return { contents };
     } catch (err) {
       if (err instanceof ResourceNotFoundError) {
-        throw new Error(`Resource not found: ${err.message}`);
+        // Surface as a typed McpError so the SDK encodes it as a proper
+        // JSON-RPC error response instead of flattening to a generic Error.
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Resource not found: ${err.message}`,
+        );
       }
       throw err;
     }
@@ -225,13 +252,8 @@ async function main(): Promise<void> {
     return { completion: { values: [], hasMore: false } };
   });
 
-  // --- Logging ---------------------------------------------------------
-
-  // Honor logging/setLevel but don't currently filter — the server itself
-  // does not emit verbose logs to the client. Declared for capability
-  // completeness; we'll wire actual structured emission as long-running ops
-  // arrive in Tier 2.
-  server.setRequestHandler(SetLevelRequestSchema, async () => ({}));
+  // Logging capability deferred — will return when long-running ops actually
+  // emit notifications.
 
   // --- Connect ---------------------------------------------------------
 

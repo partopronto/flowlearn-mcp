@@ -55,10 +55,23 @@ export type EntityEnvelope<T> = {
   warnings?: string[];
 };
 
-/** Standard envelope returned by list tools. */
+/** Standard envelope returned by list tools.
+ *
+ * NOTE on `total`: this is the count of items the upstream returned in the
+ * single fetch this server made — NOT the upstream's grand total. Local
+ * pagination (`next_cursor` / `has_more`) only reflects slicing of that
+ * single fetched page. The upstream may have additional pages we have not
+ * yet retrieved. The `total_is_local` flag below makes that explicit so
+ * callers don't mistake `total` for a global count. (The field name is kept
+ * for backwards compatibility with existing outputSchemas across tool files.)
+ */
 export type ListEnvelope<T> = {
   items: T[];
   total: number;
+  /** Always true: see JSDoc on ListEnvelope.total. Marker so MCP clients
+   *  reading the structured payload can tell `total` is post-upstream-fetch,
+   *  pre-local-slice — not a global total. */
+  total_is_local: true;
   next_cursor: string | null;
   has_more: boolean;
   summary: string;
@@ -145,21 +158,42 @@ export function editorUrl(
 }
 
 /**
- * In-memory idempotency cache keyed by client_request_id. Per-process only —
- * a Claude session that retries a `*_create` call after a network blip gets
- * back the original response instead of creating a duplicate. Unbounded keys
- * are not a concern in practice (one Claude session ≈ <100 mutations).
+ * In-memory idempotency cache keyed by `${tenantSlug}::${client_request_id}`.
+ * Per-process only — a Claude session that retries a `*_create` call after a
+ * network blip gets back the original response instead of creating a duplicate.
+ *
+ * Tenant scoping: keys MUST be prefixed with the active tenant slug. Otherwise
+ * a `flowlearn_setup_switch_tenant` followed by a retry of the same
+ * client_request_id would return the OLD tenant's cached entity id — silently
+ * cross-tenant corruption.
+ *
+ * Wiring: the active tenant slug is held in a module-level variable updated
+ * via `setActiveIdempotencyTenant(slug)`. `src/index.ts` calls it once at
+ * startup with the loaded config; `src/tools/setup.ts` calls it after every
+ * `client.setTenantSlug(...)`.
+ *
+ * Unbounded keys are not a concern in practice (one Claude session ≈ <100
+ * mutations).
  */
 const idempotencyCache = new Map<string, ToolResult>();
+let activeIdempotencyTenant = "__unscoped__";
+
+export function setActiveIdempotencyTenant(slug: string): void {
+  activeIdempotencyTenant = slug || "__unscoped__";
+}
+
+function scopedKey(key: string): string {
+  return `${activeIdempotencyTenant}::${key}`;
+}
 
 export function getIdempotent(key: string | undefined): ToolResult | undefined {
   if (!key) return undefined;
-  return idempotencyCache.get(key);
+  return idempotencyCache.get(scopedKey(key));
 }
 
 export function setIdempotent(key: string | undefined, result: ToolResult): void {
   if (!key) return;
-  idempotencyCache.set(key, result);
+  idempotencyCache.set(scopedKey(key), result);
 }
 
 /**
@@ -183,6 +217,7 @@ export function paginate<T extends Record<string, unknown>>(
   return {
     items: projected,
     total: items.length,
+    total_is_local: true,
     next_cursor,
     has_more,
     summary: `Returned ${slice.length} of ${items.length} items.`,
@@ -231,7 +266,7 @@ export const IdempotencyField = {
     .max(128)
     .optional()
     .describe(
-      "Optional idempotency key. If supplied, repeating the call with the same key returns the cached result instead of creating a duplicate. Per-process cache; resets on MCP restart.",
+      "Optional idempotency key. If supplied, repeating the call with the same key returns the cached result instead of creating a duplicate. Per-process cache; resets on MCP restart. Cache is scoped to the active tenant — a tenant switch isolates retries (so a key reused after switching does NOT return another tenant's entity id).",
     ),
 };
 

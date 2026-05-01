@@ -11,6 +11,10 @@ import {
   type ToolResult,
 } from "./common.js";
 
+// TODO: After v0.6, audit toolset and consider sub-toolset gating per Supabase
+// pattern. With outline_diff added we are now at 34 tools; PLAN.md notes
+// agent selection accuracy degrades past ~25.
+
 /**
  * One-shot course authoring: take a nested outline and create the entire
  * course tree (course → modules → lessons → flow_steps → connections) in
@@ -76,7 +80,12 @@ const ModuleInput = z.object({
 const CourseInput = z.object({
   title: z.string().min(1),
   topic: z.string().min(1),
-  description: z.string().optional(),
+  description: z
+    .string()
+    .min(20)
+    .describe(
+      "REQUIRED: 1-2 sentence summary of what the learner will be able to do after this course. Catalog renders 'No description provided' if absent — looks unfinished. Min 20 chars to prevent filler.",
+    ),
   tone: z.string().optional(),
   difficulty: z.enum(["beginner", "intermediate", "advanced"]).optional(),
   language: z.string().optional(),
@@ -113,6 +122,139 @@ type CreatedTree = {
   connections: Record<string, unknown>[];
 };
 
+const OutlineDiffEnvelope = z.object({
+  entity: z.object({
+    summary: z.string(),
+    changes: z.object({
+      modules: z.object({
+        added: z.array(z.object({ title: z.string() })),
+        removed: z.array(z.object({ id: z.string(), title: z.string() })),
+        renamed: z.array(
+          z.object({ id: z.string(), old: z.string(), new: z.string() }),
+        ),
+      }),
+      lessons: z.object({
+        added: z.array(z.object({ module: z.string(), title: z.string() })),
+        removed: z.array(z.object({ id: z.string(), title: z.string() })),
+        renamed: z.array(
+          z.object({ id: z.string(), old: z.string(), new: z.string() }),
+        ),
+      }),
+      flow_steps: z.object({
+        added: z.array(z.object({ lesson: z.string(), title: z.string() })),
+        removed: z.array(
+          z.object({ id: z.string(), lesson: z.string(), title: z.string() }),
+        ),
+        content_changed: z.array(
+          z.object({ id: z.string(), lesson: z.string(), title: z.string() }),
+        ),
+      }),
+      connections: z.object({ net_change: z.number().int() }),
+    }),
+  }),
+  summary: z.string(),
+  url: z.string().optional(),
+  resource_uri: z.string().optional(),
+  next_actions: z.array(z.string()).optional(),
+});
+
+type ExistingStep = {
+  id: string;
+  title: string;
+  content: string;
+};
+
+type ExistingLesson = {
+  id: string;
+  title: string;
+  steps: ExistingStep[];
+  connectionCount: number;
+};
+
+type ExistingModule = {
+  id: string;
+  title: string;
+  lessons: ExistingLesson[];
+};
+
+type ExistingCourseTree = {
+  id: string;
+  title: string;
+  modules: ExistingModule[];
+};
+
+async function fetchExistingCourseTree(
+  client: FlowlearnClient,
+  courseId: string,
+): Promise<ExistingCourseTree> {
+  const courseResp = await client.request<{ course?: Record<string, unknown> }>(
+    `/api/courses/${courseId}`,
+  );
+  const course = (courseResp.course ?? courseResp) as Record<string, unknown>;
+
+  const modulesArr: Record<string, unknown>[] =
+    (course.modules as Record<string, unknown>[] | undefined) ??
+    (await client
+      .request<{ modules?: unknown[] }>(`/api/courses/${courseId}/modules`)
+      .then((d) =>
+        Array.isArray(d) ? (d as Record<string, unknown>[]) : ((d.modules ?? []) as Record<string, unknown>[]),
+      )) ??
+    [];
+
+  const modules: ExistingModule[] = [];
+  for (const m of modulesArr) {
+    const moduleId = String(m.id);
+    const lessonsResp = await client.request<unknown>(
+      `/api/modules/${moduleId}/lessons`,
+    );
+    const lessons = (Array.isArray(lessonsResp)
+      ? lessonsResp
+      : (lessonsResp as { lessons?: unknown[] })?.lessons ?? []) as Record<string, unknown>[];
+
+    const lessonRecords: ExistingLesson[] = [];
+    for (const l of lessons) {
+      const lessonId = String(l.id);
+      const stepsResp = await client.request<unknown>(
+        `/api/lessons/${lessonId}/flow-steps`,
+      );
+      const steps = (Array.isArray(stepsResp)
+        ? stepsResp
+        : (stepsResp as { flow_steps?: unknown[] })?.flow_steps ?? []) as Record<string, unknown>[];
+      steps.sort((a, b) => Number(a.order_index ?? 0) - Number(b.order_index ?? 0));
+
+      let connectionCount = 0;
+      const stepRecords: ExistingStep[] = steps.map((s) => {
+        const conns = (s.connections as unknown[] | undefined) ?? [];
+        connectionCount += conns.length;
+        return {
+          id: String(s.id),
+          title: String(s.title ?? ""),
+          content: String(s.content ?? ""),
+        };
+      });
+
+      lessonRecords.push({
+        id: lessonId,
+        title: String(l.title ?? ""),
+        steps: stepRecords,
+        connectionCount,
+      });
+    }
+
+    modules.push({
+      id: moduleId,
+      title: String(m.title ?? ""),
+      lessons: lessonRecords,
+    });
+  }
+
+  return {
+    id: String(course.id ?? courseId),
+    title: String(course.title ?? ""),
+    modules,
+  };
+}
+
 export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
   const cfg = () => client.getConfig();
 
@@ -128,7 +270,7 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
         "Starting step: the first step in each lesson auto-gets is_starting_step=true unless one of the steps has it set explicitly.\n\n" +
         "Idempotent retry: pass client_request_id; same key on retry returns cached result without re-creating.\n\n" +
         "Dry-run: pass dry_run=true to validate the structure and return the plan WITHOUT mutating.\n\n" +
-        'Example call: { "course": { "title": "Spanish Greetings", "topic": "Greetings in Spanish", "modules": [{ "title": "Hellos", "lessons": [{ "title": "Saying Hello", "steps": [{"title":"Buenos días","content":"Means good morning."},{"title":"Hola","content":"Most common greeting."}] }] }] } }\n\n' +
+        'Example call: { "course": { "title": "Spanish Greetings", "topic": "Greetings in Spanish", "description": "Learn the most common Spanish greetings and when to use each one in everyday conversation.", "modules": [{ "title": "Hellos", "lessons": [{ "title": "Saying Hello", "steps": [{"title":"Buenos días","content":"Means good morning."},{"title":"Hola","content":"Most common greeting."}] }] }] } }\n\n' +
         "Errors: INVALID_ARGUMENTS on schema violations (Zod). Underlying FLOWLEARN_API_* errors abort the build; if rollback_on_error=true the course is deleted before the error returns. Returns a wrapped FLOWLEARN_API_* with details.partial_tree showing what was created before failure.",
       inputSchema: {
         course: CourseInput,
@@ -185,6 +327,35 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
 
         // Dry-run: skip idempotency cache (no side effects), return plan.
         if (dry_run) {
+          // Validate connection ranges up-front so a successful dry-run mirrors
+          // what the live branch will accept. Mirrors lines 303-312 of the
+          // live branch.
+          for (const m of course.modules) {
+            for (const l of m.lessons) {
+              const stepCount = l.steps.length;
+              const conns = l.connections ?? defaultLinearChain(stepCount);
+              for (const c of conns) {
+                if (c.from_index >= stepCount || c.from_index < 0) {
+                  return errorResult({
+                    code: "OUTLINE_VALIDATION",
+                    message: `${l.title}: connection.from_index=${c.from_index} out of range (lesson has ${stepCount} steps).`,
+                    retriable: true,
+                  });
+                }
+                if (
+                  c.to_index !== null &&
+                  (c.to_index >= stepCount || c.to_index < 0)
+                ) {
+                  return errorResult({
+                    code: "OUTLINE_VALIDATION",
+                    message: `${l.title}: connection.to_index=${c.to_index} out of range (lesson has ${stepCount} steps).`,
+                    retriable: true,
+                  });
+                }
+              }
+            }
+          }
+
           return entityResult({
             entity: {
               course: { ...course, modules: undefined },
@@ -385,26 +556,264 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
             connections_created: created.connections.length,
           };
 
+          let rolledBackOk = false;
+          let rollbackError: string | undefined;
           if (rollback_on_error && created.course) {
             try {
               await client.request(`/api/courses/${partial.course_id}`, { method: "DELETE" });
-            } catch {
-              // swallow rollback failure — surface the original error
+              rolledBackOk = true;
+            } catch (rbErr) {
+              rolledBackOk = false;
+              rollbackError = rbErr instanceof Error ? rbErr.message : String(rbErr);
             }
           }
 
           const message = err instanceof Error ? err.message : String(err);
           const code = err instanceof OutlineValidationError ? "OUTLINE_VALIDATION" : "OUTLINE_BUILD_FAILED";
+
+          let suggestion: string;
+          if (!rollback_on_error) {
+            suggestion =
+              "Course was NOT rolled back (rollback_on_error=false). Use flowlearn_course_get to inspect partial state, or flowlearn_course_delete to clean up.";
+          } else if (rolledBackOk) {
+            suggestion =
+              "Partial course was rolled back (deleted). Inspect details.partial_tree for what had been created.";
+          } else if (created.course) {
+            suggestion = `Rollback DELETE itself failed (see details.rollback_error). The partial course at id=${partial.course_id} still exists; call flowlearn_course_delete manually.`;
+          } else {
+            suggestion =
+              "No course was created before failure — nothing to roll back. Inspect details.partial_tree for context.";
+          }
+
+          const details: Record<string, unknown> = {
+            partial_tree: partial,
+            rolled_back: rolledBackOk,
+          };
+          if (rollbackError !== undefined) {
+            details.rollback_error = rollbackError;
+          }
+
           return errorResult({
             code,
             message: `outline_apply failed: ${message}`,
-            suggestion: rollback_on_error
-              ? "Partial course was rolled back (deleted). Inspect details.partial_tree for what had been created."
-              : "Course was NOT rolled back (rollback_on_error=false). Use flowlearn_course_get to inspect partial state, or flowlearn_course_delete to clean up.",
+            suggestion,
             retriable: false,
-            details: { partial_tree: partial, rolled_back: rollback_on_error && !!created.course },
+            details,
           }) satisfies ToolResult;
         }
+      },
+    },
+    {
+      name: "flowlearn_course_outline_diff",
+      description:
+        "PREVIEW the structural diff between a proposed outline tree and an existing flowlearn course, WITHOUT mutating anything. Read-only sibling of flowlearn_course_outline_apply — same input shape on the `proposed` field.\n\n" +
+        "When to use: before re-applying an edited export to compare 'what's there' vs 'what I want'; before a destructive sync to surface what would change; for human review of agent-proposed restructures.\n" +
+        "When NOT to use: actually applying changes (this is read-only — there is intentionally NO outline_apply_diff yet); fine-grained per-step content auditing (use flowlearn_course_lint or the /flowlearn:author_review prompt).\n\n" +
+        "Comparison granularity: module/lesson titles by position, step titles + content (length-only signal — full text NOT diffed unless ignore.content=false), connection counts per lesson. Renames are detected by index position (module 1 'Intro' → 'Welcome' = renamed). Full structural reconciliation is out of scope.\n\n" +
+        'Example call: { "course_id": "crs_abc", "proposed": { "title": "Spanish Greetings", "topic": "Greetings", "modules": [{ "title": "Hellos", "lessons": [{ "title": "Saying Hello", "steps": [{"title":"Hola","content":"Most common greeting."}] }] }] } }\n\n' +
+        "Errors: FLOWLEARN_API_404 if course_id invalid; INVALID_ARGUMENTS if proposed schema fails Zod validation.",
+      inputSchema: {
+        course_id: z.string().min(1),
+        proposed: CourseInput.extend({
+          description: z
+            .string()
+            .optional()
+            .describe(
+              "Optional in diff context — an empty/missing description means 'no change requested for this field'. (Required for outline_apply.)",
+            ),
+        }),
+        ignore: z
+          .object({
+            titles: z
+              .boolean()
+              .optional()
+              .describe("If true, suppress rename detection (titles[].renamed)."),
+            content: z
+              .boolean()
+              .optional()
+              .describe(
+                "If true, do not flag step content_changed entries. Default false (changes ARE reported).",
+              ),
+          })
+          .optional(),
+      },
+      outputSchema: OutlineDiffEnvelope,
+      annotations: {
+        title: "Diff outline against existing course",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      handler: async (args) => {
+        const { course_id, proposed, ignore } = args as {
+          course_id: string;
+          proposed: z.infer<typeof CourseInput> & { description?: string };
+          ignore?: { titles?: boolean; content?: boolean };
+        };
+        const ignoreTitles = ignore?.titles === true;
+        const ignoreContent = ignore?.content === true;
+
+        // Walk the existing course tree.
+        let existing: ExistingCourseTree;
+        try {
+          existing = await fetchExistingCourseTree(client, course_id);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return errorResult({
+            code: "OUTLINE_DIFF_FETCH_FAILED",
+            message: `Could not load course id=${course_id}: ${message}`,
+            suggestion:
+              "Verify course_id with flowlearn_course_list. If correct, the API may be transiently unavailable; retry.",
+            retriable: true,
+          });
+        }
+
+        // Module-level diff (positional).
+        const moduleAdded: { title: string }[] = [];
+        const moduleRemoved: { id: string; title: string }[] = [];
+        const moduleRenamed: { id: string; old: string; new: string }[] = [];
+
+        const lessonAdded: { module: string; title: string }[] = [];
+        const lessonRemoved: { id: string; title: string }[] = [];
+        const lessonRenamed: { id: string; old: string; new: string }[] = [];
+
+        const stepAdded: { lesson: string; title: string }[] = [];
+        const stepRemoved: { id: string; lesson: string; title: string }[] = [];
+        const stepContentChanged: { id: string; lesson: string; title: string }[] = [];
+
+        let proposedConnTotal = 0;
+        let existingConnTotal = 0;
+
+        const maxModules = Math.max(proposed.modules.length, existing.modules.length);
+        for (let mi = 0; mi < maxModules; mi++) {
+          const pm = proposed.modules[mi];
+          const em = existing.modules[mi];
+          if (pm && !em) {
+            moduleAdded.push({ title: pm.title });
+            // All lessons / steps under a new module are also "added".
+            for (const pl of pm.lessons) {
+              lessonAdded.push({ module: pm.title, title: pl.title });
+              for (const ps of pl.steps) {
+                stepAdded.push({ lesson: pl.title, title: ps.title });
+              }
+              proposedConnTotal += (pl.connections ?? defaultLinearChain(pl.steps.length)).length;
+            }
+            continue;
+          }
+          if (!pm && em) {
+            moduleRemoved.push({ id: em.id, title: em.title });
+            for (const el of em.lessons) {
+              lessonRemoved.push({ id: el.id, title: el.title });
+              for (const es of el.steps) {
+                stepRemoved.push({ id: es.id, lesson: el.title, title: es.title });
+              }
+              existingConnTotal += el.connectionCount;
+            }
+            continue;
+          }
+          if (!pm || !em) continue; // unreachable, but pleases TS
+
+          if (!ignoreTitles && pm.title !== em.title) {
+            moduleRenamed.push({ id: em.id, old: em.title, new: pm.title });
+          }
+
+          // Lesson-level diff within this module (positional).
+          const maxLessons = Math.max(pm.lessons.length, em.lessons.length);
+          for (let li = 0; li < maxLessons; li++) {
+            const pl = pm.lessons[li];
+            const el = em.lessons[li];
+            if (pl && !el) {
+              lessonAdded.push({ module: pm.title, title: pl.title });
+              for (const ps of pl.steps) {
+                stepAdded.push({ lesson: pl.title, title: ps.title });
+              }
+              proposedConnTotal += (pl.connections ?? defaultLinearChain(pl.steps.length)).length;
+              continue;
+            }
+            if (!pl && el) {
+              lessonRemoved.push({ id: el.id, title: el.title });
+              for (const es of el.steps) {
+                stepRemoved.push({ id: es.id, lesson: el.title, title: es.title });
+              }
+              existingConnTotal += el.connectionCount;
+              continue;
+            }
+            if (!pl || !el) continue;
+
+            if (!ignoreTitles && pl.title !== el.title) {
+              lessonRenamed.push({ id: el.id, old: el.title, new: pl.title });
+            }
+
+            proposedConnTotal += (pl.connections ?? defaultLinearChain(pl.steps.length)).length;
+            existingConnTotal += el.connectionCount;
+
+            // Step-level diff within this lesson (positional).
+            const maxSteps = Math.max(pl.steps.length, el.steps.length);
+            for (let si = 0; si < maxSteps; si++) {
+              const ps = pl.steps[si];
+              const es = el.steps[si];
+              if (ps && !es) {
+                stepAdded.push({ lesson: pl.title, title: ps.title });
+                continue;
+              }
+              if (!ps && es) {
+                stepRemoved.push({ id: es.id, lesson: el.title, title: es.title });
+                continue;
+              }
+              if (!ps || !es) continue;
+              if (!ignoreContent && ps.content !== es.content) {
+                stepContentChanged.push({ id: es.id, lesson: el.title, title: ps.title });
+              }
+            }
+          }
+        }
+
+        const netConn = proposedConnTotal - existingConnTotal;
+        const summaryParts: string[] = [];
+        if (moduleAdded.length) summaryParts.push(`+${moduleAdded.length} modules`);
+        if (moduleRemoved.length) summaryParts.push(`-${moduleRemoved.length} modules`);
+        if (lessonAdded.length) summaryParts.push(`+${lessonAdded.length} lessons`);
+        if (lessonRemoved.length) summaryParts.push(`-${lessonRemoved.length} lessons`);
+        if (stepAdded.length) summaryParts.push(`+${stepAdded.length} steps`);
+        if (stepRemoved.length) summaryParts.push(`-${stepRemoved.length} steps`);
+        if (stepContentChanged.length) summaryParts.push(`~${stepContentChanged.length} step content changes`);
+        const summary =
+          summaryParts.length === 0
+            ? `Course '${existing.title}': proposed tree matches existing structure (no changes).`
+            : `Course '${existing.title}': ${summaryParts.join(", ")}.`;
+
+        return entityResult({
+          entity: {
+            summary,
+            changes: {
+              modules: {
+                added: moduleAdded,
+                removed: moduleRemoved,
+                renamed: moduleRenamed,
+              },
+              lessons: {
+                added: lessonAdded,
+                removed: lessonRemoved,
+                renamed: lessonRenamed,
+              },
+              flow_steps: {
+                added: stepAdded,
+                removed: stepRemoved,
+                content_changed: stepContentChanged,
+              },
+              connections: {
+                net_change: netConn,
+              },
+            },
+          },
+          summary,
+          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", course_id),
+          resource_uri: `flowlearn://course/${course_id}`,
+          next_actions: [
+            `Review the diff. To apply changes today, edit the existing course with per-entity tools (flowlearn_lesson_update, flowlearn_flow_step_update, etc.) — atomic outline_apply_diff is on the roadmap but not yet shipped.`,
+          ],
+        });
       },
     },
   ];

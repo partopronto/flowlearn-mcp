@@ -238,7 +238,7 @@ export function buildModuleTools(client: FlowlearnClient): ToolDef[] {
           .min(1),
       },
       outputSchema: z.object({
-        entity: z.unknown(),
+        entity: z.record(z.unknown()),
         summary: z.string(),
         next_actions: z.array(z.string()).optional(),
       }),

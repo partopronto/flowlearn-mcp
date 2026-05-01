@@ -5,6 +5,7 @@ import {
   IdempotencyField,
   PaginationFields,
   entityResult,
+  errorResult,
   getIdempotent,
   listResult,
   paginate,
@@ -126,10 +127,10 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
       description:
         "DESTRUCTIVE: fully replace all outgoing connections from a flow step with the supplied list. Any existing connection not in the new list is deleted.\n\n" +
         "When to use: redraw a step's outgoing edges atomically (e.g., reorder buttons + change targets in one shot).\n" +
-        "When NOT to use: to add ONE button (use flowlearn_connection_add); to clear all (use flowlearn_connection_clear with the same effect as passing []).\n\n" +
+        "When NOT to use: to add ONE button (use flowlearn_connection_add); to clear all edges (use flowlearn_connection_clear — passing connections=[] here is rejected so the destructive intent is stated explicitly).\n\n" +
         "Dry-run: pass dry_run=true to preview which connections would be removed/added/changed.\n\n" +
         'Example call: { "flow_step_id": "stp_a", "connections": [{"to_step_id":"stp_b","button_text":"Yes","button_order":1},{"to_step_id":"stp_c","button_text":"No","button_order":2}] }\n\n' +
-        "Errors: FLOWLEARN_API_404 if any to_step_id invalid.",
+        "Errors: USE_CONNECTION_CLEAR if connections=[] (call flowlearn_connection_clear instead); FLOWLEARN_API_404 if any to_step_id invalid.",
       inputSchema: {
         flow_step_id: z.string().min(1),
         connections: z
@@ -157,6 +158,18 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ flow_step_id, connections, dry_run }) => {
+        // Reject empty array: clearing edges is flowlearn_connection_clear's
+        // job. Two tools doing the same destructive action is confusing for
+        // agents — force the explicit, named tool when intent is "delete all".
+        if (Array.isArray(connections) && (connections as unknown[]).length === 0) {
+          return errorResult({
+            code: "USE_CONNECTION_CLEAR",
+            message:
+              "Empty connection array — use flowlearn_connection_clear instead, which states the destructive intent explicitly.",
+            suggestion: `Call flowlearn_connection_clear with flow_step_id="${flow_step_id}" (and dry_run=true first to preview).`,
+            retriable: false,
+          });
+        }
         if (dry_run) {
           const existing = await client.request<unknown>(
             `/api/flow-steps/${flow_step_id}/connections`,

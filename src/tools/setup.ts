@@ -1,10 +1,15 @@
 import { z } from "zod";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { FlowlearnClient } from "../client.js";
-import { entityResult, errorResult, type ToolDef } from "./common.js";
+import {
+  entityResult,
+  errorResult,
+  setActiveIdempotencyTenant,
+  type ToolDef,
+} from "./common.js";
 
 const ADMIN_ROLES = ["tenant_admin", "creator", "super_admin"] as const;
 
@@ -24,11 +29,24 @@ const ENV_FILE_PATH = join(PACKAGE_ROOT, ".env");
 const CLAUDE_CONFIG_PATH = join(homedir(), ".claude.json");
 const SERVER_NAME = "flowlearn";
 
-function updateEnvFile(path: string, updates: Record<string, string>): void {
-  let lines: string[] = [];
-  if (existsSync(path)) {
-    lines = readFileSync(path, "utf-8").split(/\r?\n/);
-  }
+/**
+ * Plan describing one file write — content prepared in memory, paired with a
+ * snapshot of the previous content so we can roll back on a downstream
+ * failure. `previous === null` means the file did not exist before; rollback
+ * means deleting whatever we just wrote.
+ */
+type WritePlan = {
+  path: string;
+  newContent: string;
+  previous: string | null;
+};
+
+function planEnvFileUpdate(
+  path: string,
+  updates: Record<string, string>,
+): WritePlan {
+  const previous = existsSync(path) ? readFileSync(path, "utf-8") : null;
+  const lines = previous != null ? previous.split(/\r?\n/) : [];
 
   const seen = new Set<string>();
   const newLines = lines.map((line) => {
@@ -51,21 +69,21 @@ function updateEnvFile(path: string, updates: Record<string, string>): void {
     }
   }
 
-  writeFileSync(path, newLines.join("\n"), "utf-8");
+  return { path, newContent: newLines.join("\n"), previous };
 }
 
-function updateClaudeMcpEnv(
+function planClaudeMcpEnvUpdate(
   serverName: string,
   updates: Record<string, string>,
-): string {
+): WritePlan {
   if (!existsSync(CLAUDE_CONFIG_PATH)) {
     throw new Error(
       `${CLAUDE_CONFIG_PATH} does not exist. Cannot update MCP credentials before initial registration.`,
     );
   }
 
-  const text = readFileSync(CLAUDE_CONFIG_PATH, "utf-8");
-  const config = JSON.parse(text);
+  const previous = readFileSync(CLAUDE_CONFIG_PATH, "utf-8");
+  const config = JSON.parse(previous);
 
   if (!config.mcpServers || !config.mcpServers[serverName]) {
     throw new Error(
@@ -77,12 +95,47 @@ function updateClaudeMcpEnv(
   const existing = config.mcpServers[serverName].env ?? {};
   config.mcpServers[serverName].env = { ...existing, ...updates };
 
-  writeFileSync(
-    CLAUDE_CONFIG_PATH,
-    JSON.stringify(config, null, 2),
-    "utf-8",
-  );
-  return CLAUDE_CONFIG_PATH;
+  return {
+    path: CLAUDE_CONFIG_PATH,
+    newContent: JSON.stringify(config, null, 2),
+    previous,
+  };
+}
+
+/**
+ * Apply two prepared writes. If the FIRST succeeds and the SECOND throws,
+ * roll back the first by restoring its previous content (or deleting the
+ * file if it didn't exist before). If rollback itself fails, throw a
+ * combined error mentioning both files need manual review — this is the
+ * "BOTH locations need review" surfaced state.
+ */
+function applyWritesAtomic(first: WritePlan, second: WritePlan): void {
+  writeFileSync(first.path, first.newContent, "utf-8");
+  try {
+    writeFileSync(second.path, second.newContent, "utf-8");
+  } catch (writeErr) {
+    // Roll back the first write.
+    try {
+      if (first.previous == null) {
+        if (existsSync(first.path)) unlinkSync(first.path);
+      } else {
+        writeFileSync(first.path, first.previous, "utf-8");
+      }
+    } catch (rollbackErr) {
+      const wmsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+      const rmsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+      throw new Error(
+        `PARTIAL_WRITE_UNRECOVERABLE: failed to write '${second.path}' (${wmsg}) ` +
+          `AND failed to roll back '${first.path}' (${rmsg}). BOTH files need manual review — ` +
+          `they may be out of sync.`,
+      );
+    }
+    const wmsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+    throw new Error(
+      `Failed to persist to '${second.path}' (${wmsg}); rolled back '${first.path}'. ` +
+        `Setup is unchanged. Fix permissions on the failing path and retry.`,
+    );
+  }
 }
 
 async function validateCredentials(
@@ -272,6 +325,9 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
         }
 
         client.setTenantSlug(newSlug);
+        // Keep idempotency cache scope in lockstep with the active tenant
+        // so a retry after a switch can never return another tenant's id.
+        setActiveIdempotencyTenant(newSlug);
 
         return entityResult({
           entity: {
@@ -372,21 +428,27 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
           newTenant = match;
         }
 
-        const claudePath = updateClaudeMcpEnv(SERVER_NAME, {
+        // Compute BOTH file contents in memory before writing either, so we
+        // can apply them transactionally. If the second write fails, the
+        // first is rolled back; if rollback itself fails, the user is told
+        // both files need manual review (rather than silently leaving them
+        // out of sync).
+        const updates = {
           FLOWLEARN_EMAIL: newEmail,
           FLOWLEARN_PASSWORD: newPassword,
           FLOWLEARN_TENANT_SLUG: newSlug,
-        });
-
-        updateEnvFile(ENV_FILE_PATH, {
-          FLOWLEARN_EMAIL: newEmail,
-          FLOWLEARN_PASSWORD: newPassword,
-          FLOWLEARN_TENANT_SLUG: newSlug,
-        });
+        };
+        const claudePlan = planClaudeMcpEnvUpdate(SERVER_NAME, updates);
+        const envPlan = planEnvFileUpdate(ENV_FILE_PATH, updates);
+        applyWritesAtomic(claudePlan, envPlan);
 
         if (email) client.setEmail(newEmail);
         if (password) client.setPassword(newPassword);
-        if (slug) client.setTenantSlug(newSlug);
+        if (slug) {
+          client.setTenantSlug(newSlug);
+          // Keep idempotency cache scope in lockstep with the active tenant.
+          setActiveIdempotencyTenant(newSlug);
+        }
 
         return entityResult({
           entity: {
@@ -396,7 +458,9 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
               slug: !!slug,
             },
             active_tenant: newTenant,
-            persisted_to: [claudePath, ENV_FILE_PATH],
+            // Only populated AFTER both writes succeed (applyWritesAtomic
+            // throws otherwise, and we never reach here).
+            persisted_to: [claudePlan.path, envPlan.path],
             session_status:
               "In-memory config updated. Cached session cookie cleared if email/password changed; next tool call will sign in fresh.",
             restart_required: false,

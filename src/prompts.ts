@@ -166,7 +166,7 @@ Steps:
        "course": {
          "title": "...",
          "topic": "...",
-         "description": "<REQUIRED: 1-2 sentence summary of what the learner will be able to do after this course. Empty/missing description shows up as 'No description provided' in the catalog — which looks unfinished.>",
+         "description": "Learn to read Bollinger Bands and use them to spot volatility regimes in your trading.",
          "language": "${language}",
          "difficulty": "beginner" | "intermediate" | "advanced",
          "modules": [

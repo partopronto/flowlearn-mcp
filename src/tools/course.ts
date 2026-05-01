@@ -214,8 +214,8 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         const entity = (data.course ?? data) as Record<string, unknown>;
         const id = String(entity.id ?? course_id);
         const status = entity.status ?? "(unchanged)";
-        return entityResult({
-          entity: { ...entity, ...(data.requiresConfirmation !== undefined ? { requiresConfirmation: data.requiresConfirmation, validation: data.validation } : {}) },
+        const base = entityResult({
+          entity,
           summary: data.requiresConfirmation
             ? `Update returned requiresConfirmation — re-call with force_publish=true to override.`
             : `Updated course '${entity.title}' (id=${id}), status=${status}.`,
@@ -227,6 +227,350 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
               ? [`Course is live at ${editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id)}`]
               : [`flowlearn_course_get with course_id="${id}" to verify`],
         });
+        // Surface requiresConfirmation/validation at the envelope ROOT — they
+        // describe THIS call (a soft block on publish), not the course entity.
+        if (data.requiresConfirmation !== undefined) {
+          const sc = base.structuredContent ?? {};
+          base.structuredContent = {
+            ...sc,
+            requiresConfirmation: data.requiresConfirmation,
+            validation: data.validation,
+          };
+          base.content = [
+            { type: "text", text: JSON.stringify(base.structuredContent, null, 2) },
+            ...base.content.filter((c) => c.type !== "text"),
+          ];
+        }
+        return base;
+      },
+    },
+    {
+      name: "flowlearn_course_unpublish",
+      description:
+        "Move a published course back to draft (status='draft'). Thin wrapper around flowlearn_course_update.\n\n" +
+        "When to use: pull a live course offline so you can edit aggressively without learners seeing partial state.\n" +
+        "When NOT to use: to permanently retire a course — use flowlearn_course_update with status='archived' instead; to delete — use flowlearn_course_delete.\n\n" +
+        "Idempotent: calling on an already-draft course is a no-op (still returns the current entity).\n" +
+        "Dry-run: pass dry_run=true to preview without mutating.\n\n" +
+        'Example call: { "course_id": "crs_abc", "dry_run": true }\n\n' +
+        "Errors: FLOWLEARN_API_404 if course_id invalid.",
+      inputSchema: {
+        course_id: z.string().min(1),
+        ...DryRunField,
+      },
+      outputSchema: CourseEnvelope,
+      annotations: {
+        title: "Unpublish course",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      handler: async ({ course_id, dry_run }) => {
+        if (dry_run) {
+          try {
+            const preview = await client.request<{ course?: Record<string, unknown> }>(
+              `/api/courses/${course_id}`,
+            );
+            const c = (preview.course ?? preview) as Record<string, unknown>;
+            return entityResult({
+              entity: c,
+              summary: `[dry-run] Would unpublish course '${c.title}' (id=${course_id}, current status: ${c.status ?? "?"}). Result status would be 'draft'.`,
+              next_actions: [`Re-call without dry_run to commit.`],
+            });
+          } catch {
+            return errorResult({
+              code: "FLOWLEARN_API_404",
+              message: `Course ${course_id} not found.`,
+              suggestion: "Verify the course_id via flowlearn_course_list.",
+              retriable: false,
+            });
+          }
+        }
+        const data = await client.request<Record<string, unknown>>(
+          `/api/courses/${course_id}`,
+          { method: "PUT", body: { status: "draft" } },
+        );
+        const entity = (data.course ?? data) as Record<string, unknown>;
+        const id = String(entity.id ?? course_id);
+        return entityResult({
+          entity,
+          summary: `Unpublished course '${entity.title}' (id=${id}); status is now draft.`,
+          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id),
+          resource_uri: `flowlearn://course/${id}`,
+          next_actions: [
+            `flowlearn_course_update with course_id="${id}" + status="published" to re-publish when ready`,
+          ],
+        });
+      },
+    },
+    {
+      name: "flowlearn_course_duplicate",
+      description:
+        "Deep-copy a course as a new draft. Replicates the full tree: course metadata + modules + lessons + flow steps + connections.\n\n" +
+        "When to use: foundation for course templates, A/B variants, or branching off a stable course for major edits without disturbing the original.\n" +
+        "When NOT to use: when you only need to edit the original (use flowlearn_course_update); when uploaded images must be carried over — IMAGES ARE NOT COPIED in this duplication (image bytes live in flowlearn storage; the duplicate's flow steps reference no image until you re-upload). Re-upload images via flowlearn_flow_step_upload_image after duplication.\n\n" +
+        "The new course is always created as a draft. Title defaults to '<original title> (copy)' unless new_title is supplied.\n" +
+        "Atomicity: best-effort. On any sub-call failure, the partially-created copy is deleted (cascade). Same pattern as outline_apply.\n" +
+        "Idempotent retry: pass client_request_id.\n" +
+        "Dry-run: pass dry_run=true to preview the copy size without mutating.\n\n" +
+        'Example call: { "source_course_id": "crs_abc", "new_title": "Spanish Greetings v2" }\n\n' +
+        "Errors: FLOWLEARN_API_404 if source_course_id invalid; FLOWLEARN_API_* on any sub-create.",
+      inputSchema: {
+        source_course_id: z.string().min(1),
+        new_title: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Defaults to '<original title> (copy)'"),
+        ...IdempotencyField,
+        ...DryRunField,
+      },
+      outputSchema: CourseEnvelope,
+      annotations: {
+        title: "Duplicate course (deep copy)",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      handler: async ({ source_course_id, new_title, client_request_id, dry_run }) => {
+        // Walk the source tree.
+        let sourceCourse: Record<string, unknown>;
+        try {
+          const courseResp = await client.request<{ course?: Record<string, unknown> }>(
+            `/api/courses/${source_course_id}`,
+          );
+          sourceCourse = (courseResp.course ?? courseResp) as Record<string, unknown>;
+        } catch {
+          return errorResult({
+            code: "FLOWLEARN_API_404",
+            message: `Source course ${source_course_id} not found.`,
+            suggestion: "Verify the course_id via flowlearn_course_list.",
+            retriable: false,
+          });
+        }
+
+        const targetTitle =
+          (new_title as string | undefined) ??
+          `${sourceCourse.title ?? "Untitled"} (copy)`;
+
+        // Walk modules → lessons → steps → connections to count + plan.
+        type StepPlan = { source: Record<string, unknown> };
+        type LessonPlan = {
+          source: Record<string, unknown>;
+          steps: StepPlan[];
+          connections: Record<string, unknown>[];
+        };
+        type ModulePlan = {
+          source: Record<string, unknown>;
+          lessons: LessonPlan[];
+        };
+        const plan: ModulePlan[] = [];
+
+        const sourceModulesResp = await client.request<unknown>(
+          `/api/courses/${source_course_id}/modules`,
+        );
+        const sourceModules = (Array.isArray(sourceModulesResp)
+          ? sourceModulesResp
+          : (sourceModulesResp as { modules?: unknown[] })?.modules ?? []) as Record<
+          string,
+          unknown
+        >[];
+
+        let lessonCount = 0;
+        let stepCount = 0;
+        let connCount = 0;
+
+        for (const mod of sourceModules) {
+          const lessonsResp = await client.request<unknown>(
+            `/api/modules/${mod.id}/lessons`,
+          );
+          const sourceLessons = (Array.isArray(lessonsResp)
+            ? lessonsResp
+            : (lessonsResp as { lessons?: unknown[] })?.lessons ?? []) as Record<
+            string,
+            unknown
+          >[];
+          const lessonsPlan: LessonPlan[] = [];
+          for (const lsn of sourceLessons) {
+            const stepsResp = await client.request<unknown>(
+              `/api/lessons/${lsn.id}/flow-steps`,
+            );
+            const sourceSteps = (Array.isArray(stepsResp)
+              ? stepsResp
+              : (stepsResp as { flow_steps?: unknown[] })?.flow_steps ?? []) as Record<
+              string,
+              unknown
+            >[];
+            const conns: Record<string, unknown>[] = [];
+            for (const st of sourceSteps) {
+              const connResp = await client.request<unknown>(
+                `/api/flow-steps/${st.id}/connections`,
+              );
+              const stepConns = (Array.isArray(connResp)
+                ? connResp
+                : (connResp as { connections?: unknown[] })?.connections ?? []) as Record<
+                string,
+                unknown
+              >[];
+              for (const c of stepConns) {
+                conns.push({ ...c, _from_source_step_id: st.id });
+              }
+            }
+            lessonsPlan.push({
+              source: lsn,
+              steps: sourceSteps.map((s) => ({ source: s })),
+              connections: conns,
+            });
+            lessonCount += 1;
+            stepCount += sourceSteps.length;
+            connCount += conns.length;
+          }
+          plan.push({ source: mod, lessons: lessonsPlan });
+        }
+
+        if (dry_run) {
+          return entityResult({
+            entity: { ...sourceCourse, title: targetTitle, status: "draft" },
+            summary: `[dry-run] Would duplicate course '${sourceCourse.title}' (id=${source_course_id}) as '${targetTitle}' with ${plan.length} modules, ${lessonCount} lessons, ${stepCount} steps, ${connCount} connections. Images will NOT be copied.`,
+            next_actions: [`Re-call without dry_run to commit.`],
+          });
+        }
+
+        const cached = getIdempotent(client_request_id as string | undefined);
+        if (cached) return cached;
+
+        // Build the copy. Track the new course id for rollback.
+        let newCourseId: string | null = null;
+        try {
+          const courseResp = await client.request<{ course?: Record<string, unknown> }>(
+            "/api/courses",
+            {
+              method: "POST",
+              body: {
+                title: targetTitle,
+                topic: sourceCourse.topic,
+                description: sourceCourse.description,
+                tone: sourceCourse.tone,
+                difficulty: sourceCourse.difficulty,
+                language: sourceCourse.language,
+              },
+            },
+          );
+          const newCourse = (courseResp.course ?? courseResp) as Record<string, unknown>;
+          newCourseId = String(newCourse.id);
+
+          for (const mp of plan) {
+            const modResp = await client.request<{ module?: Record<string, unknown> }>(
+              `/api/courses/${newCourseId}/modules`,
+              {
+                method: "POST",
+                body: {
+                  title: mp.source.title,
+                  description: mp.source.description,
+                  content: mp.source.content,
+                },
+              },
+            );
+            const newMod = (modResp.module ?? modResp) as Record<string, unknown>;
+            const newModId = String(newMod.id);
+
+            for (const lp of mp.lessons) {
+              const lsnResp = await client.request<{ lesson?: Record<string, unknown> }>(
+                `/api/modules/${newModId}/lessons`,
+                {
+                  method: "POST",
+                  body: {
+                    title: lp.source.title,
+                    description: lp.source.description,
+                    content: lp.source.content,
+                  },
+                },
+              );
+              const newLsn = (lsnResp.lesson ?? lsnResp) as Record<string, unknown>;
+              const newLsnId = String(newLsn.id);
+
+              // Create steps; map old id → new id for connection rewiring.
+              const idMap = new Map<string, string>();
+              for (const sp of lp.steps) {
+                const s = sp.source;
+                const stepResp = await client.request<{
+                  flow_step?: Record<string, unknown>;
+                }>(`/api/lessons/${newLsnId}/flow-steps`, {
+                  method: "POST",
+                  body: {
+                    title: s.title,
+                    content: s.content,
+                    description: s.description,
+                    step_type: s.step_type ?? "message",
+                    is_starting_step: s.is_starting_step ?? false,
+                  },
+                });
+                const newStep = (stepResp.flow_step ?? stepResp) as Record<string, unknown>;
+                idMap.set(String(s.id), String(newStep.id));
+              }
+
+              for (const c of lp.connections) {
+                const fromOld = String(c._from_source_step_id);
+                const toOld = c.to_step_id == null ? null : String(c.to_step_id);
+                const newFrom = idMap.get(fromOld);
+                const newTo = toOld == null ? null : idMap.get(toOld) ?? null;
+                if (!newFrom) continue;
+                await client.request(`/api/flow-steps/${newFrom}/connections`, {
+                  method: "POST",
+                  body: {
+                    to_step_id: newTo,
+                    button_text: c.button_text,
+                    button_action: c.button_action ?? "next",
+                    button_order: c.button_order ?? 1,
+                  },
+                });
+              }
+
+              if (lp.source.flow_completed) {
+                await client.request(`/api/lessons/${newLsnId}`, {
+                  method: "PUT",
+                  body: { flow_completed: true },
+                });
+              }
+            }
+          }
+
+          const result = entityResult({
+            entity: { ...newCourse, title: targetTitle },
+            summary: `Duplicated course '${sourceCourse.title}' (id=${source_course_id}) as '${targetTitle}' (id=${newCourseId}) with ${plan.length} modules, ${lessonCount} lessons, ${stepCount} steps, ${connCount} connections. Images were NOT copied.`,
+            url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", newCourseId),
+            resource_uri: `flowlearn://course/${newCourseId}`,
+            next_actions: [
+              `flowlearn_course_get with course_id="${newCourseId}" to inspect`,
+              `flowlearn_flow_step_upload_image to re-attach images on the new steps`,
+            ],
+          });
+          setIdempotent(client_request_id as string | undefined, result);
+          return result;
+        } catch (err) {
+          if (newCourseId) {
+            try {
+              await client.request(`/api/courses/${newCourseId}`, { method: "DELETE" });
+            } catch {
+              // swallow rollback failure — surface the original error
+            }
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return errorResult({
+            code: "COURSE_DUPLICATE_FAILED",
+            message: `course_duplicate failed: ${message}`,
+            suggestion:
+              "Partial copy was rolled back (deleted). Inspect details for what had been created.",
+            retriable: false,
+            details: {
+              source_course_id: String(source_course_id),
+              partial_course_id: newCourseId,
+              rolled_back: !!newCourseId,
+            },
+          });
+        }
       },
     },
     {

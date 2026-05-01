@@ -73,6 +73,7 @@ const OutlineExportEnvelope = z.object({
   }),
   summary: z.string(),
   next_actions: z.array(z.string()).optional(),
+  warnings: z.array(z.string()).optional(),
 });
 
 export function buildCourseExportTools(client: FlowlearnClient): ToolDef[] {
@@ -85,7 +86,7 @@ export function buildCourseExportTools(client: FlowlearnClient): ToolDef[] {
         "When NOT to use: as a substitute for flowlearn_course_get when you only need metadata (this fetches the entire tree — N+M+K+L API calls).\n\n" +
         "Connections are translated from id-based ({flow_step_id, to_step_id}) to position-based ({from_index, to_index}) so the export can be applied to a different course without id collisions. Image URLs are preserved as `image_url` on each step (NOT re-uploaded — the agent decides whether to re-fetch when re-applying).\n\n" +
         'Example call: { "course_id": "crs_abc" }\n\n' +
-        "Errors: FLOWLEARN_API_404 if course_id invalid.",
+        "Errors / caveats: FLOWLEARN_API_404 if course_id invalid. Cross-lesson connection edges are NOT supported by outline_apply (its connections[] are positional indices into a single lesson's steps[]). If the source course contains connections that point at flow_steps in a different lesson, those edges are OMITTED from the exported tree and surfaced under top-level `warnings[]` so the agent can see what was dropped.",
       inputSchema: {
         course_id: z.string().min(1),
       },
@@ -98,6 +99,10 @@ export function buildCourseExportTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ course_id }) => {
+        // Collect non-fatal advisories (e.g. cross-lesson edges that can't
+        // round-trip through outline_apply's positional schema).
+        const warnings: string[] = [];
+
         // Walk the tree.
         const courseResp = await client.request<{ course?: Record<string, unknown> }>(
           `/api/courses/${course_id}`,
@@ -156,13 +161,30 @@ export function buildCourseExportTools(client: FlowlearnClient): ToolDef[] {
             for (const s of steps) {
               const fromIdx = stepIdToIndex.get(String(s.id));
               if (fromIdx === undefined) continue;
+              const fromTitle = String(s.title ?? "");
               const conns = (s.connections as Record<string, unknown>[] | undefined) ?? [];
               for (const c of conns) {
                 const target = c.to_step_id;
-                const toIdx =
-                  target === null || target === undefined
-                    ? null
-                    : (stepIdToIndex.get(String(target)) ?? null);
+                let toIdx: number | null;
+                if (target === null || target === undefined) {
+                  // Genuine terminal — preserve as-is.
+                  toIdx = null;
+                } else {
+                  const localIdx = stepIdToIndex.get(String(target));
+                  if (localIdx === undefined) {
+                    // Cross-lesson edge: outline_apply has no way to express
+                    // this (its connections[] are positional within a single
+                    // lesson). Coercing to null would silently turn a jump
+                    // into a terminal "Complete lesson" button on re-apply
+                    // — strictly wrong. OMIT the connection and surface a
+                    // warning so the agent can see the gap.
+                    warnings.push(
+                      `Lesson '${String(l.title ?? "")}' (id=${lessonId}): connection from step '${fromTitle}' targets step ${String(target)} which lives in a different lesson — outline_apply does not support cross-lesson edges; this connection was OMITTED in the exported tree.`,
+                    );
+                    continue;
+                  }
+                  toIdx = localIdx;
+                }
                 exportedConnections.push({
                   from_index: fromIdx,
                   to_index: toIdx,
@@ -221,11 +243,16 @@ export function buildCourseExportTools(client: FlowlearnClient): ToolDef[] {
               connections: totalConnections,
             },
           },
-          summary: `Exported course '${course.title}' (id=${course_id}): ${exportedModules.length} modules, ${totalLessons} lessons, ${totalSteps} flow steps, ${totalConnections} connections.`,
+          summary:
+            `Exported course '${course.title}' (id=${course_id}): ${exportedModules.length} modules, ${totalLessons} lessons, ${totalSteps} flow steps, ${totalConnections} connections.` +
+            (warnings.length > 0
+              ? ` ${warnings.length} cross-lesson edge(s) omitted — see warnings.`
+              : ""),
           next_actions: [
             `Edit the outline JSON in your editor / clipboard, then call flowlearn_course_outline_apply with { course: <edited-outline.course> } to recreate as a copy.`,
             `Stash this output as a template for future courses.`,
           ],
+          warnings: warnings.length > 0 ? warnings : undefined,
         });
       },
     },

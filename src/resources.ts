@@ -52,13 +52,13 @@ export const RESOURCE_TEMPLATES: ResourceTemplate[] = [
       "Full course tree as JSON: course metadata + modules array. Equivalent to flowlearn_course_get but addressable as a resource (no tool-call round trip).",
     mimeType: "application/json",
   },
-  {
-    uriTemplate: "flowlearn://lesson/{id}",
-    name: "Lesson with flow",
-    description:
-      "Lesson metadata + the lesson's flow steps and connections in one document.",
-    mimeType: "application/json",
-  },
+  // NOTE: flowlearn://lesson/{id} is intentionally NOT advertised as a
+  // template here. Reading the URI directly still works (see readResource
+  // below), but autocomplete would require walking every course → module →
+  // lesson on every keystroke — too expensive for a template completion.
+  // We re-add a template entry once a cheap tenant-wide lesson index endpoint
+  // exists upstream. Honors no-legacy-no-fallbacks: do not advertise a
+  // capability we cannot back.
 ];
 
 /** Concrete (non-templated) resources surfaced in resources/list. */
@@ -174,8 +174,10 @@ export async function completeResourceArgument(
     }
   }
 
-  // flowlearn://lesson/{id} — no cheap server endpoint to enumerate every
-  // lesson; return empty rather than make many requests.
+  // flowlearn://lesson/{id} is no longer advertised as a template (see
+  // RESOURCE_TEMPLATES above) precisely because there is no cheap server
+  // endpoint to enumerate every lesson. If a client still asks for
+  // completion on it, return an empty completion rather than 404.
   return { values: [], total: 0, hasMore: false };
 }
 

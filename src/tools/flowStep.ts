@@ -347,12 +347,267 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
           summary: `Created flow step '${entity.title}' (id=${id}, type=${entity.step_type ?? "message"}) in lesson ${lesson_id}.`,
           url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "flow_step", id, { lessonId: String(lesson_id) }),
           next_actions: [
-            `flowlearn_connection_add with flowStepId="${id}" to wire it to the next step`,
+            `flowlearn_connection_add with flow_step_id="${id}" to wire it to the next step`,
             `flowlearn_flow_step_upload_image with flow_step_id="${id}" if this step needs an image`,
           ],
         });
         setIdempotent(client_request_id as string | undefined, result);
         return result;
+      },
+    },
+    {
+      name: "flowlearn_flow_step_bulk_create",
+      description:
+        "Create multiple flow steps in a lesson in one call. Eliminates N+1 round-trips when scaffolding linear lessons.\n\n" +
+        "When to use: building a lesson's flow steps from a structured array (e.g., 5+ steps); follow-up to flowlearn_lesson_create.\n" +
+        "When NOT to use: scaffolding a brand-new course tree — use flowlearn_course_outline_apply (covers modules, lessons, steps, AND connections in one shot); when you need to wire connections — this tool does NOT create connections (call flowlearn_connection_add or flowlearn_connection_replace_all afterwards).\n\n" +
+        "Failure mode: NO automatic rollback. If step #3 fails, steps #0–#2 remain in the lesson. Inspect details.partial in the error and either continue manually (flowlearn_flow_step_create for the remainder) or clean up via flowlearn_flow_step_delete. Surfacing partial state explicitly is intentional — silent rollback would mask bugs in the caller's data.\n\n" +
+        "Idempotent retry: pass client_request_id; same key returns the cached result without re-creating.\n" +
+        "Dry-run: pass dry_run=true to validate the input without mutating.\n\n" +
+        'Example call: { "lesson_id": "lsn_abc", "steps": [{"title":"Intro","content":"...","is_starting_step":true},{"title":"Detail","content":"..."}] }\n\n' +
+        "Errors: FLOWLEARN_API_404 if lesson_id invalid; FLOWLEARN_BULK_CREATE_PARTIAL with details.created/details.failed_index on mid-batch failure.",
+      inputSchema: {
+        lesson_id: z.string().min(1),
+        steps: z
+          .array(
+            z.object({
+              title: z.string().min(1),
+              content: z.string(),
+              description: z.string().optional(),
+              step_type: StepTypeEnum.optional(),
+              is_starting_step: z.boolean().optional(),
+            }),
+          )
+          .min(1),
+        ...IdempotencyField,
+        ...DryRunField,
+      },
+      outputSchema: z.object({
+        entity: z.object({
+          lesson_id: z.string(),
+          count: z.number().int(),
+          steps: z.array(FlowStepShape),
+        }),
+        summary: z.string(),
+        next_actions: z.array(z.string()).optional(),
+      }),
+      annotations: {
+        title: "Bulk-create flow steps",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      handler: async ({ lesson_id, steps, client_request_id, dry_run }) => {
+        const stepArr = steps as Array<{
+          title: string;
+          content: string;
+          description?: string;
+          step_type?: string;
+          is_starting_step?: boolean;
+        }>;
+
+        if (dry_run) {
+          return entityResult({
+            entity: {
+              lesson_id: String(lesson_id),
+              count: stepArr.length,
+              steps: stepArr as unknown as Record<string, unknown>[],
+            },
+            summary: `[dry-run] Would create ${stepArr.length} flow step(s) in lesson ${lesson_id}.`,
+            next_actions: [`Re-call without dry_run to commit.`],
+          });
+        }
+
+        const cached = getIdempotent(client_request_id as string | undefined);
+        if (cached) return cached;
+
+        const created: Record<string, unknown>[] = [];
+        for (let i = 0; i < stepArr.length; i++) {
+          const s = stepArr[i];
+          try {
+            const data = await client.request<{ flow_step?: Record<string, unknown> }>(
+              `/api/lessons/${lesson_id}/flow-steps`,
+              {
+                method: "POST",
+                body: {
+                  title: s.title,
+                  content: s.content,
+                  description: s.description,
+                  step_type: s.step_type ?? "message",
+                  is_starting_step: s.is_starting_step ?? false,
+                },
+              },
+            );
+            const entity = (data.flow_step ?? data) as Record<string, unknown>;
+            created.push(entity);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return errorResult({
+              code: "FLOWLEARN_BULK_CREATE_PARTIAL",
+              message: `bulk_create failed at step index ${i}: ${message}. ${created.length}/${stepArr.length} steps were created and remain in lesson ${lesson_id}.`,
+              suggestion:
+                "Inspect details.created for what was created, then either retry the remaining steps individually with flowlearn_flow_step_create, or clean up via flowlearn_flow_step_delete on each created id.",
+              retriable: false,
+              details: {
+                lesson_id: String(lesson_id),
+                failed_index: i,
+                attempted: stepArr.length,
+                created_count: created.length,
+                created,
+              },
+            });
+          }
+        }
+
+        const result = entityResult({
+          entity: {
+            lesson_id: String(lesson_id),
+            count: created.length,
+            steps: created,
+          },
+          summary: `Created ${created.length} flow step(s) in lesson ${lesson_id}.`,
+          next_actions: [
+            `flowlearn_connection_add to wire the new steps; or use flowlearn_course_outline_apply next time to bundle steps + connections in one call.`,
+          ],
+        });
+        setIdempotent(client_request_id as string | undefined, result);
+        return result;
+      },
+    },
+    {
+      name: "flowlearn_flow_step_move",
+      description:
+        "Move a flow step to a new position WITHIN ITS CURRENT LESSON. Connections are preserved (reorder is metadata-only).\n\n" +
+        "When to use: change the order of steps in a lesson without breaking the connection graph (e.g., swap step 2 and step 3).\n" +
+        "When NOT to use: cross-lesson moves — NOT YET SUPPORTED (creates orphan connections); to delete (use flowlearn_flow_step_delete); to reorder ALL steps at once (use flowlearn_flow_step_reorder, which takes the full ordered list).\n\n" +
+        "Implementation: thin convenience over flowlearn_flow_step_reorder. Fetches the lesson's current ordered step ids, computes the new ordering with target step in new_position, and submits the full list to the reorder endpoint. The first id in the resulting list becomes the starting step, so moving to position 0 promotes the step to lesson entry.\n\n" +
+        "Dry-run: pass dry_run=true to preview the resulting order without mutating.\n\n" +
+        'Example call: { "flow_step_id": "stp_abc", "new_position": 0 }\n\n' +
+        "Errors: FLOWLEARN_API_404 if flow_step_id invalid; INVALID_ARGUMENTS if new_position is out of range.",
+      inputSchema: {
+        flow_step_id: z.string().min(1),
+        new_position: z
+          .number()
+          .int()
+          .min(0)
+          .describe("0-indexed target position within the lesson's step list."),
+        ...DryRunField,
+      },
+      outputSchema: z.object({
+        entity: z.object({
+          flow_step_id: z.string(),
+          lesson_id: z.string(),
+          old_position: z.number().int(),
+          new_position: z.number().int(),
+          ordered_step_ids: z.array(z.string()),
+        }),
+        summary: z.string(),
+        next_actions: z.array(z.string()).optional(),
+      }),
+      annotations: {
+        title: "Move flow step (intra-lesson)",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      handler: async ({ flow_step_id, new_position, dry_run }) => {
+        // Resolve the lesson via GET /api/flow-steps/{id}.
+        let lessonId: string;
+        try {
+          const stepResp = await client.request<{ flow_step?: Record<string, unknown> }>(
+            `/api/flow-steps/${flow_step_id}`,
+          );
+          const step = (stepResp.flow_step ?? stepResp) as Record<string, unknown>;
+          if (!step.lesson_id) {
+            return errorResult({
+              code: "FLOWLEARN_API_404",
+              message: `Flow step ${flow_step_id} returned no lesson_id; cannot determine which lesson to reorder.`,
+              suggestion:
+                "Verify flow_step_id via flowlearn_flow_step_list. The API may have changed its response shape.",
+              retriable: false,
+            });
+          }
+          lessonId = String(step.lesson_id);
+        } catch {
+          return errorResult({
+            code: "FLOWLEARN_API_404",
+            message: `Flow step ${flow_step_id} not found.`,
+            suggestion: "Verify the flow_step_id via flowlearn_flow_step_list.",
+            retriable: false,
+          });
+        }
+
+        // Pull the current ordered step list.
+        const listResp = await client.request<unknown>(
+          `/api/lessons/${lessonId}/flow-steps`,
+        );
+        const arr = (Array.isArray(listResp)
+          ? listResp
+          : (listResp as { flow_steps?: unknown[] })?.flow_steps ?? []) as Record<
+          string,
+          unknown
+        >[];
+        const ids = arr.map((s) => String(s.id));
+        const oldPosition = ids.indexOf(String(flow_step_id));
+        if (oldPosition < 0) {
+          return errorResult({
+            code: "FLOWLEARN_API_404",
+            message: `Flow step ${flow_step_id} not found in lesson ${lessonId}'s ordered list.`,
+            suggestion:
+              "The step may have been deleted between the previous call and this one; refresh via flowlearn_flow_step_list.",
+            retriable: false,
+          });
+        }
+        const target = new_position as number;
+        if (target >= ids.length) {
+          return errorResult({
+            code: "INVALID_ARGUMENTS",
+            message: `new_position=${target} is out of range; lesson ${lessonId} has ${ids.length} step(s) (max index ${ids.length - 1}).`,
+            suggestion: `Use a value between 0 and ${ids.length - 1}.`,
+            retriable: false,
+          });
+        }
+
+        // Compute new order by removing the id from its current slot and
+        // inserting at target.
+        const reordered = ids.slice();
+        reordered.splice(oldPosition, 1);
+        reordered.splice(target, 0, String(flow_step_id));
+
+        if (dry_run) {
+          return entityResult({
+            entity: {
+              flow_step_id: String(flow_step_id),
+              lesson_id: lessonId,
+              old_position: oldPosition,
+              new_position: target,
+              ordered_step_ids: reordered,
+            },
+            summary: `[dry-run] Would move step ${flow_step_id} from position ${oldPosition} to ${target} in lesson ${lessonId}.`,
+            next_actions: [`Re-call without dry_run to commit.`],
+          });
+        }
+
+        await client.request(`/api/lessons/${lessonId}/flow-steps/reorder`, {
+          method: "PUT",
+          body: { steps: reordered.map((id) => ({ id })) },
+        });
+
+        return entityResult({
+          entity: {
+            flow_step_id: String(flow_step_id),
+            lesson_id: lessonId,
+            old_position: oldPosition,
+            new_position: target,
+            ordered_step_ids: reordered,
+          },
+          summary: `Moved step ${flow_step_id} from position ${oldPosition} to ${target} in lesson ${lessonId}. Connections preserved.`,
+          next_actions: [
+            `flowlearn_flow_step_list with lesson_id="${lessonId}" to verify.`,
+          ],
+        });
       },
     },
     {
@@ -419,7 +674,13 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         ...DryRunField,
       },
       outputSchema: z.object({
-        entity: z.object({ id: z.string(), deleted: z.boolean() }).passthrough(),
+        entity: z
+          .object({
+            id: z.union([z.string(), z.number()]),
+            deleted: z.boolean(),
+            dry_run: z.boolean().optional(),
+          })
+          .passthrough(),
         summary: z.string(),
         next_actions: z.array(z.string()).optional(),
       }),
@@ -432,11 +693,24 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
       },
       handler: async ({ flow_step_id, dry_run }) => {
         if (dry_run) {
-          return entityResult({
-            entity: { id: String(flow_step_id), deleted: false, dry_run: true },
-            summary: `[dry-run] Would delete flow step ${flow_step_id} and its connections + image.`,
-            next_actions: [`Re-call without dry_run to commit.`],
-          });
+          try {
+            const preview = await client.request<{ flow_step?: Record<string, unknown> }>(
+              `/api/flow-steps/${flow_step_id}`,
+            );
+            const s = (preview.flow_step ?? preview) as Record<string, unknown>;
+            return entityResult({
+              entity: { id: String(flow_step_id), deleted: false, dry_run: true, would_delete: s },
+              summary: `[dry-run] Would delete flow step '${s.title ?? flow_step_id}' (id=${flow_step_id}) and its connections + image.`,
+              next_actions: [`Re-call without dry_run to commit.`],
+            });
+          } catch {
+            return errorResult({
+              code: "FLOWLEARN_API_404",
+              message: `Could not fetch flow step ${flow_step_id} to preview deletion.`,
+              suggestion: "Verify the flow_step_id via flowlearn_flow_step_list.",
+              retriable: false,
+            });
+          }
         }
         await client.request(`/api/flow-steps/${flow_step_id}`, { method: "DELETE" });
         return entityResult({
@@ -459,7 +733,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         steps: z.array(z.object({ id: z.string() })).min(1),
       },
       outputSchema: z.object({
-        entity: z.unknown(),
+        entity: z.record(z.unknown()),
         summary: z.string(),
         next_actions: z.array(z.string()).optional(),
       }),
@@ -589,14 +863,23 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         "Remove the image from a flow step. Idempotent — succeeds silently if no image is set.\n\n" +
         "When to use: clear the image before uploading a replacement, or strip an unwanted image.\n" +
         "When NOT to use: to delete the step itself (use flowlearn_flow_step_delete).\n\n" +
-        'Example call: { "flow_step_id": "stp_abc" }\n\n' +
+        "Dry-run: pass dry_run=true to verify the step exists and preview the deletion without mutating.\n\n" +
+        'Example call: { "flow_step_id": "stp_abc", "dry_run": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if flow_step_id invalid.",
       inputSchema: {
         flow_step_id: z.string().min(1),
+        ...DryRunField,
       },
       outputSchema: z.object({
-        entity: z.unknown(),
+        entity: z
+          .object({
+            id: z.union([z.string(), z.number()]).optional(),
+            image_url: z.string().nullable().optional(),
+            dry_run: z.boolean().optional(),
+          })
+          .passthrough(),
         summary: z.string(),
+        next_actions: z.array(z.string()).optional(),
       }),
       annotations: {
         title: "Delete flow-step image",
@@ -605,7 +888,24 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         idempotentHint: true,
         openWorldHint: true,
       },
-      handler: async ({ flow_step_id }) => {
+      handler: async ({ flow_step_id, dry_run }) => {
+        if (dry_run) {
+          try {
+            await client.request(`/api/flow-steps/${flow_step_id}`);
+          } catch {
+            return errorResult({
+              code: "FLOWLEARN_API_404",
+              message: `Flow step ${flow_step_id} not found.`,
+              suggestion: "Verify the flow_step_id via flowlearn_flow_step_list.",
+              retriable: false,
+            });
+          }
+          return entityResult({
+            entity: { id: String(flow_step_id), dry_run: true },
+            summary: `[dry-run] Would delete image from flow step ${flow_step_id}.`,
+            next_actions: [`Re-call without dry_run to delete.`],
+          });
+        }
         const data = await client.request<unknown>(
           `/api/flow-steps/${flow_step_id}/image`,
           { method: "DELETE" },
