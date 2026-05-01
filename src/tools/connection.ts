@@ -192,6 +192,192 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
       },
     },
     {
+      name: "flowlearn_connection_graph_replace",
+      description:
+        "DESTRUCTIVE: atomically replace ALL outgoing connections for EVERY flow step in a lesson with a new edge list. The only safe way to rewire a lesson's full flow graph in one call.\n\n" +
+        "When to use: you have the complete desired connection graph for a lesson ready and want to replace the existing edges atomically; after flowlearn_course_outline_apply_diff surfaces connection warnings and you need to reconcile them.\n" +
+        "When NOT to use: rewiring a single step (use flowlearn_connection_replace_all); inspecting edges before editing (use flowlearn_connection_list); when you only want to ADD edges (use flowlearn_connection_add).\n\n" +
+        "Validation BEFORE mutating: every from_flow_step_id and every non-null to_flow_step_id must belong to this lesson. Cross-lesson edges are rejected with INVALID_ARGUMENTS listing the offending step ids.\n\n" +
+        "Atomicity: best-effort. Edges are replaced step-by-step (clear then write each step in sequence). On failure mid-way, details.partial reports the last step processed. NO rollback — clearing edges is irreversible without a snapshot.\n\n" +
+        "Dry-run: pass dry_run=true to see current edges per step AND the proposed edges, without mutating.\n\n" +
+        'Example call: { "lesson_id": "les_abc", "edges": [{"from_flow_step_id":"stp_1","to_flow_step_id":"stp_2","button_text":"Next","button_order":1},{"from_flow_step_id":"stp_2","to_flow_step_id":null,"button_text":"Finish","button_order":1}] }\n\n' +
+        "Errors: INVALID_ARGUMENTS if any step id is cross-lesson; FLOWLEARN_API_404 if lesson_id invalid. On partial failure: GRAPH_REPLACE_PARTIAL with details.partial.",
+      inputSchema: {
+        lesson_id: z.string().min(1).describe("ID of the lesson whose flow graph to replace"),
+        edges: z
+          .array(
+            z.object({
+              from_flow_step_id: z
+                .string()
+                .min(1)
+                .describe("The step that has this outgoing button (must be in this lesson)"),
+              to_flow_step_id: z
+                .string()
+                .nullable()
+                .describe("Target step (must be in this lesson), or null for terminal buttons"),
+              button_text: z.string().min(1).describe("Button label"),
+              button_action: ButtonActionEnum.optional().describe("Defaults to 'next'"),
+              button_order: z.number().int().min(1).describe("Display order among buttons on this step"),
+            }),
+          )
+          .describe("Complete desired edge list for the lesson"),
+        ...DryRunField,
+      },
+      outputSchema: z.object({
+        entity: z.object({
+          lesson_id: z.string(),
+          steps_processed: z.number().int(),
+          edges_written: z.number().int(),
+          dry_run: z.boolean().optional(),
+          current_per_step: z.unknown().optional(),
+          proposed_per_step: z.unknown().optional(),
+          partial: z.unknown().optional(),
+        }),
+        summary: z.string(),
+        next_actions: z.array(z.string()).optional(),
+      }),
+      annotations: {
+        title: "Replace lesson connection graph",
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      handler: async ({ lesson_id, edges, dry_run }) => {
+        const lessonIdStr = lesson_id as string;
+        const edgeList = edges as Array<{
+          from_flow_step_id: string;
+          to_flow_step_id: string | null;
+          button_text: string;
+          button_action?: string;
+          button_order: number;
+        }>;
+
+        // --- Fetch lesson's flow steps to validate ownership ---
+        const stepsResp = await client.request<unknown>(
+          `/api/lessons/${lessonIdStr}/flow-steps`,
+        );
+        const steps = (
+          Array.isArray(stepsResp)
+            ? stepsResp
+            : (stepsResp as { flow_steps?: unknown[] })?.flow_steps ?? []
+        ) as Record<string, unknown>[];
+        const stepIds = new Set(steps.map((s) => String(s.id)));
+
+        // Validate that all step ids in the edge list belong to this lesson.
+        const offenders: string[] = [];
+        for (const edge of edgeList) {
+          if (!stepIds.has(edge.from_flow_step_id)) offenders.push(edge.from_flow_step_id);
+          if (edge.to_flow_step_id !== null && !stepIds.has(edge.to_flow_step_id)) {
+            offenders.push(edge.to_flow_step_id);
+          }
+        }
+        if (offenders.length > 0) {
+          return errorResult({
+            code: "INVALID_ARGUMENTS",
+            message: `The following step ids are not part of lesson ${lessonIdStr}: ${[...new Set(offenders)].join(", ")}`,
+            suggestion: "Call flowlearn_flow_step_list with lesson_id to get the valid step ids for this lesson.",
+            retriable: false,
+            details: { lesson_id: lessonIdStr, offending_step_ids: [...new Set(offenders)] },
+          });
+        }
+
+        // Group edges by from_flow_step_id for efficient per-step writes.
+        const edgesByStep = new Map<string, typeof edgeList>();
+        for (const edge of edgeList) {
+          if (!edgesByStep.has(edge.from_flow_step_id)) {
+            edgesByStep.set(edge.from_flow_step_id, []);
+          }
+          edgesByStep.get(edge.from_flow_step_id)!.push(edge);
+        }
+
+        // --- Dry-run ---
+        if (dry_run) {
+          const currentPerStep: Record<string, unknown[]> = {};
+          for (const s of steps) {
+            const sid = String(s.id);
+            const conns = (s.connections as unknown[] | undefined) ?? [];
+            currentPerStep[sid] = conns;
+          }
+          const proposedPerStep: Record<string, unknown[]> = {};
+          for (const [sid, stepEdges] of edgesByStep) {
+            proposedPerStep[sid] = stepEdges;
+          }
+          return entityResult({
+            entity: {
+              lesson_id: lessonIdStr,
+              steps_processed: 0,
+              edges_written: 0,
+              dry_run: true,
+              current_per_step: currentPerStep,
+              proposed_per_step: proposedPerStep,
+            },
+            summary: `[dry-run] Would replace connections on ${stepIds.size} step(s) in lesson ${lessonIdStr} with ${edgeList.length} total edge(s).`,
+            next_actions: [`Re-call without dry_run to commit.`],
+          });
+        }
+
+        // --- Apply: for each step in the lesson, clear then write new edges ---
+        let stepsProcessed = 0;
+        let edgesWritten = 0;
+
+        for (const step of steps) {
+          const sid = String(step.id);
+          const newEdges = edgesByStep.get(sid) ?? [];
+
+          try {
+            // Clear existing connections for this step.
+            await client.request(`/api/flow-steps/${sid}/connections`, { method: "DELETE" });
+
+            // Write new connections.
+            for (const edge of newEdges) {
+              await client.request(`/api/flow-steps/${sid}/connections`, {
+                method: "POST",
+                body: {
+                  to_step_id: edge.to_flow_step_id,
+                  button_text: edge.button_text,
+                  button_action: edge.button_action ?? "next",
+                  button_order: edge.button_order,
+                },
+              });
+              edgesWritten++;
+            }
+            stepsProcessed++;
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return errorResult({
+              code: "GRAPH_REPLACE_PARTIAL",
+              message: `Failed at step ${sid} (${stepsProcessed}/${stepIds.size} steps completed): ${message}`,
+              suggestion:
+                "No rollback attempted — clearing edges is irreversible without a snapshot. Inspect details.partial to see how far the replace got, then manually reconcile the remaining steps.",
+              retriable: false,
+              details: {
+                partial: {
+                  lesson_id: lessonIdStr,
+                  steps_completed: stepsProcessed,
+                  steps_total: stepIds.size,
+                  failed_at_step_id: sid,
+                  edges_written_so_far: edgesWritten,
+                },
+              },
+            });
+          }
+        }
+
+        return entityResult({
+          entity: {
+            lesson_id: lessonIdStr,
+            steps_processed: stepsProcessed,
+            edges_written: edgesWritten,
+          },
+          summary: `Replaced connection graph for lesson ${lessonIdStr}: ${stepsProcessed} step(s) processed, ${edgesWritten} edge(s) written.`,
+          next_actions: [
+            `Use flowlearn_course_lint to verify no orphan steps or dangling connections remain.`,
+          ],
+        });
+      },
+    },
+    {
       name: "flowlearn_connection_clear",
       description:
         "DESTRUCTIVE: delete all outgoing connections from a flow step.\n\n" +

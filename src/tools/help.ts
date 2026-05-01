@@ -35,8 +35,23 @@ Prompts (slash commands in Claude Code):
 - /flowlearn:author_review     Editorial pass — image-references-without-images, quiz answer leaks, weak descriptions, copyrighted/promotional images, last-lesson navigation loops
 
 Round-trip tools (Tier 3):
-- flowlearn_course_outline_apply  Take a nested outline → builds the entire course in one call
-- flowlearn_course_export_outline Take an existing course_id → returns the same nested-outline shape (round-trip; use for backups, templates, offline edits)
+- flowlearn_course_outline_apply         Take a nested outline → builds the entire course in one call
+- flowlearn_course_outline_apply_diff    Take an outline + existing course_id → recompute & apply the diff (rename / append / trail-delete; best-effort rollback)
+- flowlearn_course_export_outline        Take an existing course_id → returns the same nested-outline shape as JSON
+- flowlearn_course_export_markdown       Same export, rendered as self-parsing markdown
+- flowlearn_course_import_markdown       Parse markdown produced by export_markdown back into a course (build directly, or dry_run to preview)
+
+Quality / audit tools (Tier 2.5):
+- flowlearn_course_lint                  STRUCTURAL: missing terminal buttons, dangling connections, no starting step, etc.
+- flowlearn_course_audit_objectives      Lessons that don't map to any module objective (Jaccard ≥ 0.2)
+- flowlearn_course_estimate_duration     Reading-time per lesson/module/course based on word/image/video counts
+- flowlearn_course_dead_link_scan        HEAD outbound URLs in step content; report 4xx/5xx/timeouts
+- flowlearn_course_readability_check     Flesch-Kincaid grade level vs declared difficulty
+- flowlearn_course_audit_bloom           Bloom's-taxonomy verb distribution; flag shallow / gap categories
+
+Atomic batch tools (Tier 2):
+- flowlearn_course_transaction           Run multiple mutations sequentially with rollback (creates only — no deletes/updates can be rolled back)
+- flowlearn_connection_graph_replace     Replace ALL connections in a lesson atomically (best-effort)
 
 Authoring — fast path (preferred):
   1. flowlearn_setup_status                          → orient

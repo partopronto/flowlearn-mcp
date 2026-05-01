@@ -11,10 +11,6 @@ import {
   type ToolResult,
 } from "./common.js";
 
-// TODO: After v0.6, audit toolset and consider sub-toolset gating per Supabase
-// pattern. With outline_diff added we are now at 34 tools; PLAN.md notes
-// agent selection accuracy degrades past ~25.
-
 /**
  * One-shot course authoring: take a nested outline and create the entire
  * course tree (course → modules → lessons → flow_steps → connections) in
@@ -811,7 +807,7 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
           url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", course_id),
           resource_uri: `flowlearn://course/${course_id}`,
           next_actions: [
-            `Review the diff. To apply changes today, edit the existing course with per-entity tools (flowlearn_lesson_update, flowlearn_flow_step_update, etc.) — atomic outline_apply_diff is on the roadmap but not yet shipped.`,
+            `Review the diff, then call flowlearn_course_outline_apply_diff with the same { course_id, proposed } to apply the changes. Or edit per-entity (flowlearn_lesson_update, flowlearn_flow_step_update, etc.) for surgical control.`,
           ],
         });
       },

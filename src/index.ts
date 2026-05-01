@@ -31,8 +31,12 @@ import { buildConnectionTools } from "./tools/connection.js";
 import { buildSetupTools } from "./tools/setup.js";
 import { buildHelpTools } from "./tools/help.js";
 import { buildCourseOutlineTools } from "./tools/courseOutline.js";
+import { buildCourseOutlineApplyDiffTools } from "./tools/courseOutlineApplyDiff.js";
 import { buildCourseLintTools } from "./tools/courseLint.js";
+import { buildCourseAuditTools } from "./tools/courseAudit.js";
 import { buildCourseExportTools } from "./tools/courseExport.js";
+import { buildCourseMarkdownTools } from "./tools/courseMarkdown.js";
+import { buildTransactionTools } from "./tools/transaction.js";
 import {
   RESOURCE_TEMPLATES,
   ResourceNotFoundError,
@@ -67,8 +71,11 @@ async function main(): Promise<void> {
     ...buildSetupTools(client),
     ...buildCourseTools(client),
     ...buildCourseOutlineTools(client),
+    ...buildCourseOutlineApplyDiffTools(client),
     ...buildCourseLintTools(client),
+    ...buildCourseAuditTools(client),
     ...buildCourseExportTools(client),
+    ...buildCourseMarkdownTools(client),
     ...buildModuleTools(client),
     ...buildLessonTools(client),
     ...buildFlowStepTools(client),
@@ -77,10 +84,19 @@ async function main(): Promise<void> {
 
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
+  // Transaction tool dispatches through the registry, so it must be wired
+  // after toolsByName is built. The closure over toolsByName is captured by
+  // reference; the handler reads it at call time.
+  const transactionTools = buildTransactionTools(client, () => toolsByName);
+  for (const t of transactionTools) {
+    tools.push(t);
+    toolsByName.set(t.name, t);
+  }
+
   const server = new Server(
     {
       name: "flowlearn-mcp",
-      version: "0.6.0",
+      version: "0.7.0",
       // SDK Implementation schema (BaseMetadataSchema + ImplementationSchema)
       // accepts title, websiteUrl, description, icons. We populate the polish
       // fields the SDK exposes today; icons are deferred until we have a
@@ -261,7 +277,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   process.stderr.write(
-    `flowlearn-mcp v0.6.0 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
+    `flowlearn-mcp v0.7.0 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
   );
 }
 
