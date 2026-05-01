@@ -43,9 +43,10 @@ After `pytest` passes, log into `https://flowlearn.io/<tenant>/courses` and find
 ## Clean up
 
 ```bash
-python tests/cleanup.py
+python tests/cleanup.py            # delete every test course on the tenant
+python tests/cleanup.py --dry-run  # list what would be deleted, mutate nothing
 ```
 
-Reads `tests/.course-id.txt`, calls `flowlearn_course_delete` on that id, removes the file. The delete cascades to all child entities and uploaded images.
+Lists every course whose title starts with `MCP Test - ` (the prefix used by `conftest.py`) and deletes them in one pass. Idempotent — safe to run with no orphans. Replaces the older `.course-id.txt`-based approach, which only cleaned up the most recent run and accumulated debris over multiple test runs.
 
-If `tests/.course-id.txt` was lost (e.g. you cleared the file manually) you'll need to delete the course from the UI.
+The delete cascades to all child entities and uploaded images, and removes any leftover `.course-id.txt`.
