@@ -80,7 +80,7 @@ async function main(): Promise<void> {
   const server = new Server(
     {
       name: "flowlearn-mcp",
-      version: "0.5.0",
+      version: "0.6.0",
       // SDK Implementation schema (BaseMetadataSchema + ImplementationSchema)
       // accepts title, websiteUrl, description, icons. We populate the polish
       // fields the SDK exposes today; icons are deferred until we have a
@@ -261,7 +261,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   process.stderr.write(
-    `flowlearn-mcp v0.5.0 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
+    `flowlearn-mcp v0.6.0 ready: ${tools.length} tools, ${RESOURCE_TEMPLATES.length} resource templates, ${PROMPTS.length} prompts, tenant=${config.tenantSlug}, base=${config.baseUrl}\n`,
   );
 }
 
