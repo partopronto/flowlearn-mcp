@@ -7,7 +7,7 @@ End-to-end test suite that drives the MCP server over stdio JSON-RPC and exercis
 ## Install
 
 ```bash
-cd mcp/flowlearn-mcp
+cd flowlearn-mcp
 pip install -r tests/requirements.txt
 npm run build  # tests need dist/index.js
 ```
@@ -17,7 +17,7 @@ npm run build  # tests need dist/index.js
 ## Run
 
 ```bash
-cd mcp/flowlearn-mcp
+cd flowlearn-mcp
 pytest tests/ -v
 ```
 
@@ -27,7 +27,7 @@ Test order:
 |---|---|---|
 | 1 | `test_01_creation_*` | Course → 2 modules → 2 lessons → 5 flow steps → 3 connections built. Round-trips via list endpoints. |
 | 2 | `test_02_edit_*` | Updating course title, module description, and flow step content persists across re-fetch. |
-| 3 | `test_03_publish_*` | Marking every lesson `flow_completed=true` then `course.update status=published` flips the status. |
+| 3 | `test_03_publish_*` | Marking every lesson `flow_completed=true` then `flowlearn_course_update status=published` flips the status. |
 
 The `course_structure` fixture in `conftest.py` builds the tree once per session. The created course's id is written to `tests/.course-id.txt` (gitignored).
 
@@ -46,6 +46,6 @@ After `pytest` passes, log into `https://flowlearn.io/<tenant>/courses` and find
 python tests/cleanup.py
 ```
 
-Reads `tests/.course-id.txt`, calls `course.delete` on that id, removes the file. The delete cascades to all child entities and uploaded images.
+Reads `tests/.course-id.txt`, calls `flowlearn_course_delete` on that id, removes the file. The delete cascades to all child entities and uploaded images.
 
 If `tests/.course-id.txt` was lost (e.g. you cleared the file manually) you'll need to delete the course from the UI.

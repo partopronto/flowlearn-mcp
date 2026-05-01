@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { FlowlearnClient } from "../client.js";
-import { jsonResult, type ToolDef } from "./common.js";
+import { entityResult, errorResult, type ToolDef } from "./common.js";
 
 const ADMIN_ROLES = ["tenant_admin", "creator", "super_admin"] as const;
 
@@ -15,7 +15,6 @@ type Membership = {
   role: string;
 };
 
-// dist/tools/setup.js → dist/.. = package root
 const PACKAGE_ROOT = join(
   dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -25,10 +24,6 @@ const ENV_FILE_PATH = join(PACKAGE_ROOT, ".env");
 const CLAUDE_CONFIG_PATH = join(homedir(), ".claude.json");
 const SERVER_NAME = "flowlearn";
 
-/**
- * Update or insert key=value lines in a .env file. Preserves comments and
- * unrelated keys. Creates the file if it doesn't exist.
- */
 function updateEnvFile(path: string, updates: Record<string, string>): void {
   let lines: string[] = [];
   if (existsSync(path)) {
@@ -59,10 +54,6 @@ function updateEnvFile(path: string, updates: Record<string, string>): void {
   writeFileSync(path, newLines.join("\n"), "utf-8");
 }
 
-/**
- * Update env vars on the named MCP server entry in ~/.claude.json. Throws if
- * the server isn't registered. Returns the path written.
- */
 function updateClaudeMcpEnv(
   serverName: string,
   updates: Record<string, string>,
@@ -94,11 +85,6 @@ function updateClaudeMcpEnv(
   return CLAUDE_CONFIG_PATH;
 }
 
-/**
- * Validate a candidate (email, password) by attempting a sign-in against
- * Better Auth. Throws with a friendly message on failure. Does not mutate
- * any cookie cache — runs an isolated fetch.
- */
 async function validateCredentials(
   baseUrl: string,
   email: string,
@@ -130,14 +116,47 @@ async function validateCredentials(
 export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
   return [
     {
-      name: "setup.status",
+      name: "flowlearn_setup_status",
       description:
-        "Diagnostic: returns the MCP's current configuration (signed-in email, " +
-        "active tenant slug), the matching membership record, and all of the " +
-        "user's admin-role tenants. Forces a fresh sign-in if the cached " +
-        "session has expired. Use this to answer 'who am I and which tenant " +
-        "am I currently acting on?'",
+        "Canonical entry point: returns who is signed in, active tenant, all admin tenants, recent courses on the active tenant, and a suggested next action. Confirms auth still works.\n\n" +
+        "When to use: at the start of a session to orient yourself; after a tenant switch; whenever you're unsure of state.\n" +
+        "When NOT to use: as a tool-call replacement for actions — this is read-only orientation.\n\n" +
+        "Returns:\n" +
+        "  email                   — the signed-in user\n" +
+        "  active_tenant_slug      — the tenant tools currently act on\n" +
+        "  active_tenant           — full membership record (or null if not a member)\n" +
+        "  active_tenant_is_admin  — whether the role grants write access\n" +
+        "  all_admin_tenants       — every tenant where the user has an admin role\n" +
+        "  recent_courses          — up to 10 most-recent courses on the active tenant (id, title, status)\n" +
+        "  suggested_next_action   — concrete next tool to call\n" +
+        "  auth_confirmed          — true if a fresh-or-cached cookie validated\n\n" +
+        'Example call: {} (no arguments)\n\n' +
+        "Errors: FLOWLEARN_API_401 if credentials invalid — call flowlearn_setup_update to fix.",
       inputSchema: {},
+      outputSchema: z.object({
+        entity: z
+          .object({
+            email: z.string(),
+            active_tenant_slug: z.string(),
+            active_tenant: z.unknown().nullable(),
+            active_tenant_is_admin: z.boolean(),
+            all_admin_tenants: z.array(z.unknown()),
+            recent_courses: z.array(
+              z.object({ id: z.string(), title: z.string(), status: z.string().optional() }).passthrough(),
+            ),
+            suggested_next_action: z.string(),
+            auth_confirmed: z.boolean(),
+          })
+          .passthrough(),
+        summary: z.string(),
+      }),
+      annotations: {
+        title: "Status / orientation",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
       handler: async () => {
         const data = await client.request<{ memberships?: Membership[] }>(
           "/api/register/memberships",
@@ -149,32 +168,78 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
         const adminTenants = memberships.filter((m) =>
           (ADMIN_ROLES as readonly string[]).includes(m.role),
         );
+        const activeIsAdmin = currentTenant
+          ? (ADMIN_ROLES as readonly string[]).includes(currentTenant.role)
+          : false;
 
-        return jsonResult({
-          email: cfg.email,
-          activeTenantSlug: cfg.tenantSlug,
-          activeTenant: currentTenant,
-          activeTenantIsAdmin: currentTenant
-            ? (ADMIN_ROLES as readonly string[]).includes(currentTenant.role)
-            : false,
-          allAdminTenants: adminTenants,
-          authConfirmed: true,
+        let recentCourses: Array<{ id: string; title: string; status?: string }> = [];
+        if (activeIsAdmin) {
+          try {
+            const courseData = await client.request<unknown>("/api/courses");
+            const arr = (Array.isArray(courseData) ? courseData : (courseData as { courses?: unknown[] })?.courses ?? []) as Record<string, unknown>[];
+            recentCourses = arr.slice(0, 10).map((c) => ({
+              id: String(c.id),
+              title: String(c.title),
+              status: c.status as string | undefined,
+            }));
+          } catch {
+            // Non-fatal — status should still return useful info.
+          }
+        }
+
+        const suggested = !activeIsAdmin
+          ? `You are not an admin on '${cfg.tenantSlug}'. Call flowlearn_setup_switch_tenant with one of: ${adminTenants.map((m) => m.slug).join(", ") || "(no admin tenants)"}.`
+          : recentCourses.length === 0
+            ? `Tenant '${cfg.tenantSlug}' has no courses yet. Call flowlearn_course_create to start.`
+            : `Tenant '${cfg.tenantSlug}' has ${recentCourses.length}+ courses. Call flowlearn_course_list to browse, or flowlearn_course_get with one of the ids in recent_courses.`;
+
+        return entityResult({
+          entity: {
+            email: cfg.email,
+            active_tenant_slug: cfg.tenantSlug,
+            active_tenant: currentTenant,
+            active_tenant_is_admin: activeIsAdmin,
+            all_admin_tenants: adminTenants,
+            recent_courses: recentCourses,
+            suggested_next_action: suggested,
+            auth_confirmed: true,
+          },
+          summary: `Signed in as ${cfg.email}, active tenant '${cfg.tenantSlug}' (admin=${activeIsAdmin}). ${recentCourses.length} recent course(s) cached.`,
         });
       },
     },
     {
-      name: "setup.switchTenant",
+      name: "flowlearn_setup_switch_tenant",
       description:
-        "Switch which tenant the MCP acts on behalf of for the rest of this " +
-        "Claude Code session. The change is IN-MEMORY ONLY and reverts when " +
-        "Claude restarts. To make it permanent, use setup.update with the slug " +
-        "field, or run `python scripts/register.py --slug <slug>` in terminal. " +
-        "The new slug must belong to one of your admin-role tenants.",
+        "Switch which tenant the MCP acts on for the rest of this session. IN-MEMORY ONLY — reverts on Claude restart.\n\n" +
+        "When to use: temporarily try acting on a different tenant. The slug must belong to one of your admin-role memberships.\n" +
+        "When NOT to use: to make a permanent change — use flowlearn_setup_update with the slug field, or run `python scripts/register.py --slug <slug>` in a terminal.\n\n" +
+        'Example call: { "slug": "acme" }\n\n' +
+        "Errors: returns INVALID_TENANT or NOT_ADMIN with the list of valid slugs in suggestion.",
       inputSchema: {
         slug: z
           .string()
           .min(1)
           .describe("Slug of one of your admin-role tenants"),
+      },
+      outputSchema: z.object({
+        entity: z
+          .object({
+            switched: z.boolean(),
+            previous_slug: z.string(),
+            active_tenant: z.unknown(),
+            persistence: z.string(),
+          })
+          .passthrough(),
+        summary: z.string(),
+        next_actions: z.array(z.string()).optional(),
+      }),
+      annotations: {
+        title: "Switch tenant (in-memory)",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
       },
       handler: async ({ slug }) => {
         const newSlug = String(slug).toLowerCase();
@@ -189,39 +254,50 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
 
         if (!match) {
           const available = memberships.map((m) => m.slug).join(", ");
-          throw new Error(
-            `'${newSlug}' is not one of your tenants. ` +
-              `Available: ${available || "(none)"}.`,
-          );
+          return errorResult({
+            code: "INVALID_TENANT",
+            message: `'${newSlug}' is not one of your tenants.`,
+            suggestion: `Available: ${available || "(none)"}.`,
+            retriable: false,
+            details: { available_slugs: memberships.map((m) => m.slug) },
+          });
         }
         if (!(ADMIN_ROLES as readonly string[]).includes(match.role)) {
-          throw new Error(
-            `Your role on '${newSlug}' is '${match.role}', which is not an ` +
-              `admin role. Required: ${ADMIN_ROLES.join(", ")}.`,
-          );
+          return errorResult({
+            code: "NOT_ADMIN",
+            message: `Your role on '${newSlug}' is '${match.role}', which is not an admin role.`,
+            suggestion: `Required: ${ADMIN_ROLES.join(", ")}.`,
+            retriable: false,
+          });
         }
 
         client.setTenantSlug(newSlug);
 
-        return jsonResult({
-          switched: true,
-          previousSlug,
-          activeTenant: match,
-          persistence: "in-memory only for this session",
-          toPersist: `Call setup.update with {slug: "${newSlug}"} to make it permanent.`,
+        return entityResult({
+          entity: {
+            switched: true,
+            previous_slug: previousSlug,
+            active_tenant: match,
+            persistence: "in-memory only for this session",
+          },
+          summary: `Switched active tenant from '${previousSlug}' to '${newSlug}' (in-memory only).`,
+          next_actions: [
+            `flowlearn_setup_update with slug="${newSlug}" to make permanent`,
+            `flowlearn_course_list to see courses on the new tenant`,
+          ],
         });
       },
     },
     {
-      name: "setup.update",
+      name: "flowlearn_setup_update",
       description:
-        "Persistently update one or more of email/password/tenant slug. " +
-        "WARNING: passing a password as a tool argument means it goes into " +
-        "this Claude Code chat transcript. Validates new credentials by " +
-        "signing in fresh, then writes to BOTH ~/.claude.json (for future " +
-        "Claude sessions) AND the package's .env file. The current MCP " +
-        "process also picks up the new values immediately — no Claude " +
-        "restart required. If validation fails, nothing is written.",
+        "Persistently update one or more of email/password/tenant slug. Validates new credentials before writing.\n\n" +
+        "When to use: rotate password; switch primary tenant permanently; change the signed-in account.\n" +
+        "When NOT to use: temporary tenant switches (use flowlearn_setup_switch_tenant).\n\n" +
+        "WARNING: passing a password as a tool argument means it appears in the Claude Code chat transcript. For sensitive rotations, run `python scripts/register.py` in a terminal instead (hidden prompt, no transcript).\n\n" +
+        "Writes to BOTH ~/.claude.json AND the package's .env. The current process picks up new values immediately — no Claude restart required. If validation fails, nothing is written.\n\n" +
+        'Example call: { "slug": "newtenant" }\n\n' +
+        "Errors: validation_failed (creds rejected); INVALID_TENANT (slug not in memberships); NOT_ADMIN (slug role insufficient).",
       inputSchema: {
         email: z.string().email().optional(),
         password: z.string().min(1).optional(),
@@ -229,31 +305,47 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
           .string()
           .min(1)
           .optional()
-          .describe("Will be lowercased; must be an admin-role tenant"),
+          .describe("Lowercased; must be an admin-role tenant"),
+      },
+      outputSchema: z.object({
+        entity: z
+          .object({
+            updated: z.object({
+              email: z.boolean(),
+              password: z.boolean(),
+              slug: z.boolean(),
+            }),
+            active_tenant: z.unknown().nullable(),
+            persisted_to: z.array(z.string()),
+            session_status: z.string(),
+            restart_required: z.boolean(),
+          })
+          .passthrough(),
+        summary: z.string(),
+      }),
+      annotations: {
+        title: "Update credentials/tenant (persistent)",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
       },
       handler: async ({ email, password, slug }) => {
         if (!email && !password && !slug) {
-          throw new Error(
-            "Provide at least one of: email, password, slug.",
-          );
+          return errorResult({
+            code: "NO_FIELDS_PROVIDED",
+            message: "Provide at least one of: email, password, slug.",
+            retriable: true,
+          });
         }
 
         const cfg = client.getConfig();
         const newEmail = (email as string | undefined) ?? cfg.email;
         const newPassword = (password as string | undefined) ?? cfg.password;
-        const newSlug = slug
-          ? String(slug).toLowerCase()
-          : cfg.tenantSlug;
+        const newSlug = slug ? String(slug).toLowerCase() : cfg.tenantSlug;
 
-        // Step 1: validate the new (email, password) combo before touching
-        // any persistence layer. If creds are bad, fail fast and leave the
-        // existing setup intact.
         await validateCredentials(cfg.baseUrl, newEmail, newPassword);
 
-        // Step 2: if slug is changing, validate it's one of the user's admin
-        // tenants. We use the existing client (with old creds) to keep this
-        // simple; sign-in with new creds happens below when we mutate the
-        // in-memory config.
         let newTenant: Membership | null = null;
         if (slug) {
           const data = await client.request<{ memberships?: Membership[] }>(
@@ -262,53 +354,54 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
           const memberships = data.memberships ?? [];
           const match = memberships.find((m) => m.slug === newSlug);
           if (!match) {
-            const available = memberships.map((m) => m.slug).join(", ");
-            throw new Error(
-              `Tenant slug '${newSlug}' not found in your memberships. ` +
-                `Available: ${available || "(none)"}.`,
-            );
+            return errorResult({
+              code: "INVALID_TENANT",
+              message: `Tenant slug '${newSlug}' not found in your memberships.`,
+              suggestion: `Available: ${memberships.map((m) => m.slug).join(", ") || "(none)"}.`,
+              retriable: false,
+            });
           }
           if (!(ADMIN_ROLES as readonly string[]).includes(match.role)) {
-            throw new Error(
-              `Your role on '${newSlug}' is '${match.role}', not an admin ` +
-                `role. Required: ${ADMIN_ROLES.join(", ")}.`,
-            );
+            return errorResult({
+              code: "NOT_ADMIN",
+              message: `Role on '${newSlug}' is '${match.role}', not an admin role.`,
+              suggestion: `Required: ${ADMIN_ROLES.join(", ")}.`,
+              retriable: false,
+            });
           }
           newTenant = match;
         }
 
-        // Step 3: persist to ~/.claude.json (for future Claude sessions)
         const claudePath = updateClaudeMcpEnv(SERVER_NAME, {
           FLOWLEARN_EMAIL: newEmail,
           FLOWLEARN_PASSWORD: newPassword,
           FLOWLEARN_TENANT_SLUG: newSlug,
         });
 
-        // Step 4: persist to .env (for register.py / tests)
         updateEnvFile(ENV_FILE_PATH, {
           FLOWLEARN_EMAIL: newEmail,
           FLOWLEARN_PASSWORD: newPassword,
           FLOWLEARN_TENANT_SLUG: newSlug,
         });
 
-        // Step 5: in-memory update so the current session uses new values
         if (email) client.setEmail(newEmail);
         if (password) client.setPassword(newPassword);
         if (slug) client.setTenantSlug(newSlug);
 
-        return jsonResult({
-          updated: {
-            email: !!email,
-            password: !!password,
-            slug: !!slug,
+        return entityResult({
+          entity: {
+            updated: {
+              email: !!email,
+              password: !!password,
+              slug: !!slug,
+            },
+            active_tenant: newTenant,
+            persisted_to: [claudePath, ENV_FILE_PATH],
+            session_status:
+              "In-memory config updated. Cached session cookie cleared if email/password changed; next tool call will sign in fresh.",
+            restart_required: false,
           },
-          activeTenant: newTenant,
-          persistedTo: [claudePath, ENV_FILE_PATH],
-          sessionStatus:
-            "In-memory config updated. The cached session cookie is " +
-            "cleared if email/password changed; the next tool call will " +
-            "trigger a fresh sign-in.",
-          restartRequired: false,
+          summary: `Persisted updates: email=${!!email}, password=${!!password}, slug=${!!slug}. No restart required.`,
         });
       },
     },

@@ -4,16 +4,30 @@ MCP server that exposes Flowlearn course-creation actions to Claude Code (termin
 
 ## What it does
 
-Surfaces 29 tools that mirror what a tenant admin can do in the course-creation UI, plus three setup helpers callable from inside a Claude session. Server-side AI is intentionally not exposed (no `createWithAI`, no `improve`, no interview tools); the calling agent generates content and persists it via the dedicated tools.
+Surfaces 30 tools that mirror what a tenant admin can do in the course-creation UI, plus a help/reference tool and three setup helpers callable from inside a Claude session. Server-side AI is intentionally not exposed (no `createWithAI`, no `improve`, no interview tools); the calling agent generates content and persists it via the dedicated tools.
 
-- **Setup (3)** — `setup.status`, `setup.switchTenant`, `setup.update`
-- **Course (5)** — `course.list`, `course.get`, `course.create`, `course.update`, `course.delete`
-- **Module (5)** — `module.list`, `module.create`, `module.update`, `module.delete`, `module.reorder`
-- **Lesson (5)** — `lesson.list`, `lesson.get`, `lesson.create`, `lesson.update`, `lesson.delete`
-- **FlowStep (7)** — `flowStep.list`, `flowStep.create`, `flowStep.update`, `flowStep.delete`, `flowStep.reorder`, `flowStep.uploadImage`, `flowStep.deleteImage`
-- **Connection (4)** — `connection.list`, `connection.add`, `connection.replaceAll`, `connection.clear`
+- **Help (1)** — `flowlearn_help`
+- **Setup (3)** — `flowlearn_setup_status`, `flowlearn_setup_switch_tenant`, `flowlearn_setup_update`
+- **Course (5)** — `flowlearn_course_list`, `flowlearn_course_get`, `flowlearn_course_create`, `flowlearn_course_update`, `flowlearn_course_delete`
+- **Module (5)** — `flowlearn_module_list`, `flowlearn_module_create`, `flowlearn_module_update`, `flowlearn_module_delete`, `flowlearn_module_reorder`
+- **Lesson (5)** — `flowlearn_lesson_list`, `flowlearn_lesson_get`, `flowlearn_lesson_create`, `flowlearn_lesson_update`, `flowlearn_lesson_delete`
+- **FlowStep (7)** — `flowlearn_flow_step_list`, `flowlearn_flow_step_create`, `flowlearn_flow_step_update`, `flowlearn_flow_step_delete`, `flowlearn_flow_step_reorder`, `flowlearn_flow_step_upload_image`, `flowlearn_flow_step_delete_image`
+- **Connection (4)** — `flowlearn_connection_list`, `flowlearn_connection_add`, `flowlearn_connection_replace_all`, `flowlearn_connection_clear`
 
-The base URL is hardcoded to `https://flowlearn.io`. Delete and replace-all tools are always exposed.
+The base URL is hardcoded to `https://flowlearn.io`. Delete and replace-all tools are always exposed but support `dry_run: true` for previews.
+
+### Conventions (every tool)
+
+Adopted in v0.2.0 across all tools:
+
+- **Names** — `flowlearn_<resource>_<verb>` snake_case. Old dotted names (`course.list`) are gone.
+- **Annotations** — every tool declares MCP `readOnlyHint` / `destructiveHint` / `idempotentHint` so clients can auto-approve safe ops.
+- **Output schemas** — every tool publishes a JSON Schema for its return shape.
+- **Mutating tools** return `{ entity, summary, url?, next_actions? }`.
+- **List tools** return `{ items, total, next_cursor, has_more, summary }`. All accept `limit`, `cursor`, and `response_format: "concise" | "detailed"`.
+- **Create tools** accept an optional `client_request_id` — same key on retry returns the cached result instead of creating a duplicate (per-process, resets on MCP restart).
+- **Destructive tools** accept `dry_run: true` to preview the cascade without mutating.
+- **Errors** — tool-level failures return structured `{ isError: true, code, message, suggestion?, retriable, details? }` instead of unstructured text.
 
 ### Setup tools — what's possible from inside Claude
 
@@ -21,11 +35,11 @@ Initial registration must happen in the terminal (chicken-and-egg: Claude can't 
 
 | Tool | Use it for |
 |---|---|
-| `setup.status` | "Who am I signed in as, what tenant am I on, and what other admin tenants do I have?" Returns email, active tenant, and the full list of admin-role memberships. Confirms auth still works. |
-| `setup.switchTenant` | "Switch to tenant `acme` for the rest of this session." In-memory only — reverts on Claude restart. Useful for trying something without committing. |
-| `setup.update` | "Persistently update my email / password / tenant." Validates the new creds by signing in, then writes them to BOTH `~/.claude.json` (for future Claude sessions) AND the package's `.env`. The current session also picks up the new values immediately — **no Claude restart required**. If validation fails, nothing is written. |
+| `flowlearn_setup_status` | Canonical entry point: who am I, what tenant am I on, what other admin tenants do I have, what are my recent courses, what should I do next? Confirms auth still works. |
+| `flowlearn_setup_switch_tenant` | "Switch to tenant `acme` for the rest of this session." In-memory only — reverts on Claude restart. Useful for trying something without committing. |
+| `flowlearn_setup_update` | "Persistently update my email / password / tenant." Validates the new creds by signing in, then writes them to BOTH `~/.claude.json` (for future Claude sessions) AND the package's `.env`. The current session also picks up the new values immediately — **no Claude restart required**. If validation fails, nothing is written. |
 
-**Security note on `setup.update`:** passing your password as a tool argument means it appears in your Claude Code chat transcript. Acceptable if that's your call; if not, run `python scripts/register.py` in terminal — that uses a hidden prompt and never touches the transcript.
+**Security note on `flowlearn_setup_update`:** passing your password as a tool argument means it appears in your Claude Code chat transcript. Acceptable if that's your call; if not, run `python scripts/register.py` in terminal — that uses a hidden prompt and never touches the transcript.
 
 ## Setup — one command
 
@@ -42,7 +56,7 @@ python scripts/register.py         # interactive setup
 3. **Auto-picks your tenant** if you admin exactly one. Otherwise shows a numbered list and asks.
 4. **Writes `.env`** — gitignored, never leaves the package directory.
 5. **Registers with Claude Code** at `--scope user` so the MCP is available from any project.
-6. **Verifies end-to-end** — spawns the MCP, calls `course.list`, reports the course count (success) or the exact API error (failure).
+6. **Verifies end-to-end** — spawns the MCP, calls a list endpoint, reports the course count (success) or the exact API error (failure).
 
 Re-run any time to change credentials or switch tenants.
 
@@ -51,7 +65,7 @@ Re-run any time to change credentials or switch tenants.
 ```bash
 python scripts/register.py --email you@example.com --password '<pw>' -y
 # add --slug acme if you admin multiple tenants
-# add --no-verify to skip the post-registration course.list call
+# add --no-verify to skip the post-registration verification call
 ```
 
 WARNING: passing `--password` exposes it in shell history and the process list. Use the interactive prompt unless you have a specific automation reason.
@@ -67,7 +81,7 @@ claude mcp list           # should show 'flowlearn ✓ Connected'
 claude mcp get flowlearn  # shows config including env values
 ```
 
-Inside a Claude Code session, `/mcp` shows the server status and 29 tools. If you change credentials, restart any open session.
+Inside a Claude Code session, `/mcp` shows the server status and 30 tools. If you change credentials, restart any open session.
 
 ### Alternative — manual `claude mcp add`
 
@@ -101,46 +115,48 @@ Add to `claude_desktop_config.json` (Mac: `~/Library/Application Support/Claude/
 }
 ```
 
-Restart Claude Desktop. The 29 tools appear under the `flowlearn` server.
+Restart Claude Desktop. The 30 tools appear under the `flowlearn` server.
 
 ## For Claude / AI agents — how to use this MCP
 
 This section is written for an AI agent (you) that has the `flowlearn` MCP loaded and is being asked to do work in a Flowlearn tenant. Follow these patterns; they encode every gotcha learned during the build.
 
-### Always start with `setup.status`
+### Always start with `flowlearn_setup_status`
 
-Before any other tool call in a fresh session, call `setup.status`. It returns the signed-in email, the active tenant slug, and the user's full list of admin-role tenants. Use it to:
+Before any other tool call in a fresh session, call `flowlearn_setup_status`. It returns the signed-in email, the active tenant slug, the user's full list of admin-role tenants, the 10 most-recent courses on the active tenant, and a `suggested_next_action` string. Use it to:
 
 - Confirm the MCP is healthy (auth works) before doing real work.
 - Verify the user is on the tenant they expect — slug names sometimes look right but aren't.
-- Enumerate options if you'll need to ask the user "which tenant?" later.
+- Skip the `flowlearn_course_list` round-trip when you only need recent course ids.
 
-If `setup.status` fails, do not try to recover by guessing — report the exact error to the user and ask them to run `python scripts/register.py` in their terminal.
+For a refresher on the data model and conventions, call `flowlearn_help` (topics: `overview`, `publishing`, `enums`, `troubleshooting`).
+
+If `flowlearn_setup_status` fails, do not try to recover by guessing — report the exact error to the user and ask them to run `python scripts/register.py` in their terminal.
 
 ### Read before you write
 
-Always call a `*.list` or `*.get` tool to find IDs before you call `*.update` or `*.delete`. Never construct an ID, never reuse an ID from a previous turn without re-listing — the user may have changed things in the UI in between.
+Always call a `*_list` or `*_get` tool to find IDs before you call `*_update` or `*_delete`. Never construct an ID, never reuse an ID from a previous turn without re-listing — the user may have changed things in the UI in between.
 
-Recommended discovery sequence: `course.list` → pick course id → `course.get` (shows modules) → pick module id → `lesson.list` → pick lesson id → `flowStep.list` (shows steps + connections in one call).
+Recommended discovery sequence: `flowlearn_course_list` → pick course id → `flowlearn_course_get` (shows modules) → pick module id → `flowlearn_lesson_list` → pick lesson id → `flowlearn_flow_step_list` (shows steps + connections in one call).
 
 ### Creating a course from scratch — canonical sequence
 
 This is the only correct order. Skipping a step or reordering will produce silently broken courses.
 
-1. `course.create` — `{title, topic}`. Both required. Returns `{course: {id, ...}}`.
-2. `module.create` — once per module. Returns `{module: {id, order_index}}`.
-3. `lesson.create` — once per lesson, scoped to a module. Returns `{lesson: {id}}`.
-4. `flowStep.create` — once per step. The **first** step in each lesson MUST have `is_starting_step: true`; the others omit it. Returns `{flow_step: {id}}`.
-5. `connection.add` — wires steps together. Each connection lives **on the source step**, points `to_step_id` at the target. Use `button_order: 1` for the first button on a step, 2 for the second, etc. `to_step_id: null` for terminal buttons.
-6. `lesson.update` — set `flow_completed: true` on every lesson. **Without this, publishing will fail.**
-7. `course.update` — `{status: "published"}`. If you get `requiresConfirmation: true`, re-call with `forcePublish: true`.
+1. `flowlearn_course_create` — `{title, topic}`. Both required. Returns `{entity: {id, ...}, summary, url, next_actions}`.
+2. `flowlearn_module_create` — once per module. Returns `{entity: {id, order_index, ...}, ...}`.
+3. `flowlearn_lesson_create` — once per lesson, scoped to a module.
+4. `flowlearn_flow_step_create` — once per step. The **first** step in each lesson MUST have `is_starting_step: true`; the others omit it.
+5. `flowlearn_connection_add` — wires steps together. Each connection lives **on the source step**, points `to_step_id` at the target. Use `button_order: 1` for the first button on a step, 2 for the second, etc. `to_step_id: null` for terminal buttons.
+6. `flowlearn_lesson_update` — set `flow_completed: true` on every lesson. **Without this, publishing will fail.**
+7. `flowlearn_course_update` — `{status: "published"}`. If you get `requiresConfirmation: true` inside `entity`, re-call with `force_publish: true`.
 
 ### Editing an existing course
 
-- To rename / change description / change topic: `course.update`.
-- To rewrite a step's text: `flowStep.update` with `content`. Note that `flowStep.update` also accepts a `buttons` array that REPLACES outgoing connections — for clarity, prefer the `connection.*` tools when only touching edges.
-- To reorder modules / steps: use the dedicated `*.reorder` tools, passing the FULL list of ids in the new order. Partial lists are not supported.
-- To change which step starts a lesson: include all steps in `flowStep.reorder` with the new starting step first; the API auto-sets `is_starting_step` based on order.
+- To rename / change description / change topic: `flowlearn_course_update`.
+- To rewrite a step's text: `flowlearn_flow_step_update` with `content`. Note that this tool also accepts a `buttons` array that REPLACES outgoing connections — for clarity, prefer the `flowlearn_connection_*` tools when only touching edges.
+- To reorder modules / steps: use the dedicated `*_reorder` tools, passing the FULL list of ids in the new order. Partial lists are not supported.
+- To change which step starts a lesson: include all steps in `flowlearn_flow_step_reorder` with the new starting step first; the API auto-sets `is_starting_step` based on order.
 
 ### Publishing — what the validator actually checks
 
@@ -150,41 +166,41 @@ Reject conditions (return 400 unless overridden):
 - A module has lesson-completion gaps (later complete, earlier not) while later modules have content.
 - A module is empty while later modules have completed content.
 
-Warning conditions (return 200 with `requiresConfirmation: true` — pass `forcePublish: true` to override):
+Warning conditions (return 200 with `requiresConfirmation: true` — pass `force_publish: true` to override):
 - Trailing modules are empty.
 - A module is partially complete.
 
-Recipe to reliably publish: every module has ≥1 lesson with `flow_completed: true`, in order, no gaps. Set `flow_completed` with `lesson.update`.
+Recipe to reliably publish: every module has ≥1 lesson with `flow_completed: true`, in order, no gaps. Set `flow_completed` with `flowlearn_lesson_update`.
 
 ### Common errors and what they mean
 
-| Error | Likely cause | Fix |
+| Error code | Likely cause | Fix |
 |---|---|---|
-| `403 USER_NOT_IN_TENANT` | Active tenant slug doesn't match any of your admin memberships | Call `setup.status` to see your tenants, then `setup.switchTenant` (or `setup.update` to persist) |
-| `403 InsufficientPermissions` | Your role on this tenant isn't `tenant_admin` / `creator` / `super_admin` | Ask a tenant admin to upgrade your role |
-| `401` on first call | Session cookie expired (the MCP auto-retries once) | If repeated: bad credentials. Use `setup.update` to fix |
-| `400` on `course.update status=published` | Validation failed — see "Publishing rules" above | Set `flow_completed` on all lessons, or pass `forcePublish: true` if you got `requiresConfirmation` |
-| `400 ValidationError on file` (uploadImage) | Wrong format or > 10 MB | PNG / JPEG / WebP / GIF only; MCP reduces to WebP server-side |
-| `404 NotFound` on a resource | Wrong id, or another agent / human deleted it | Re-list to get a current id |
-| Tool returns weird shape | API responses vary per route — most wrap as `{course: {...}}` or `{module: {...}}`; some return arrays | Don't assume — `JSON.parse` and probe |
+| `FLOWLEARN_API_403` | Active tenant slug doesn't grant write access (no admin role) | Call `flowlearn_setup_status`; switch with `flowlearn_setup_switch_tenant` (or `flowlearn_setup_update` to persist) |
+| `FLOWLEARN_API_401` | Credentials invalid (after one auto-retry) | Use `flowlearn_setup_update` to fix |
+| `FLOWLEARN_API_400` on `flowlearn_course_update status=published` | Validation failed — see "Publishing rules" above | Set `flow_completed` on all lessons, or pass `force_publish: true` if you got `requiresConfirmation` |
+| `FLOWLEARN_API_400` on `flowlearn_flow_step_upload_image` | Wrong format or > 10 MB | PNG / JPEG / WebP / GIF only; MCP reduces to WebP server-side |
+| `FLOWLEARN_API_404` on a resource | Wrong id, or another agent / human deleted it | Re-list to get a current id |
+| `INVALID_ARGUMENTS` | Zod validation failed | Read `details.issues` for path-level violations |
+| `INVALID_TENANT` / `NOT_ADMIN` | Slug not in your memberships, or role insufficient | Use the slugs in `details.available_slugs` |
 
 ### Anti-patterns — don't do these
 
 - **Don't try to call `course.createWithAI`, `course.improve`, `module.improve`, `interview.questions`, or `interview.validate`.** They don't exist by design — server-side AI is intentionally not exposed. You generate content yourself, then persist it via the dedicated tools.
-- **Don't hand-craft IDs.** They're UUIDs returned by create calls. Always store and reuse the returned id.
-- **Don't call `course.delete` without confirming with the user first** — it cascades to everything underneath (modules, lessons, steps, connections, uploaded images). Same for the other `*.delete` tools.
-- **Don't pass `goal` to `course.create`.** The schema does not include it. (Historical reason: server-side that field triggered AI auto-generation, which we don't want.)
+- **Don't hand-craft IDs.** They're UUIDs returned by create calls. Always store and reuse the returned id from `entity.id`.
+- **Don't call `flowlearn_course_delete` without confirming with the user first** — it cascades to everything underneath (modules, lessons, steps, connections, uploaded images). Same for the other `*_delete` tools. Use `dry_run: true` to preview first.
+- **Don't pass `goal` to `flowlearn_course_create`.** The schema does not include it. (Historical reason: server-side that field triggered AI auto-generation, which we don't want.)
 - **Don't forget `is_starting_step: true` on the first step of each lesson.** The lesson will render but the learner will hit a dead end.
-- **Don't assume slugs are case-insensitive.** They aren't (server-side bug — see [BUG-017](../../Flowlearn/docs/bugs/BUG-017-tenant-slug-case-sensitive-lookup.md) in the parent project). The MCP normalizes for you, but if you're constructing slug-bearing requests outside this MCP, lowercase them.
+- **Don't use the old dotted tool names** (`course.list`, `flowStep.create`, etc.). They were removed in v0.2.0 and now return `UNKNOWN_TOOL`.
 
 ### When to use the setup tools
 
 | Situation | Tool | Why |
 |---|---|---|
-| Fresh session, first action | `setup.status` | Confirm where you are and that auth works |
-| User has multiple tenants and wants to do work on a specific one for one task | `setup.switchTenant` | Session-only switch, reverts on Claude restart |
-| User says "from now on, default to tenant X" or "change my password" | `setup.update` | Persists to `~/.claude.json` AND `.env`; current session also picks up immediately |
-| User says "what are my Flowlearn tenants?" | `setup.status` (read `allAdminTenants`) | One call, no extra round trip |
+| Fresh session, first action | `flowlearn_setup_status` | Confirm where you are, see recent courses, get a suggested next action |
+| User has multiple tenants and wants to do work on a specific one for one task | `flowlearn_setup_switch_tenant` | Session-only switch, reverts on Claude restart |
+| User says "from now on, default to tenant X" or "change my password" | `flowlearn_setup_update` | Persists to `~/.claude.json` AND `.env`; current session also picks up immediately |
+| User says "what are my Flowlearn tenants?" | `flowlearn_setup_status` (read `all_admin_tenants`) | One call, no extra round trip |
 
 ## Example workflow — building a small course
 
@@ -196,23 +212,23 @@ The agent's call sequence (the agent generates the actual Spanish content; the M
 
 | # | Tool | Args (abridged) | Returns |
 |---|---|---|---|
-| 1 | `course.create` | `{ title: "Beginner Spanish for Travelers", topic: "Spanish for travel" }` | `course.id = c1` |
-| 2 | `module.create` | `{ courseId: c1, title: "Greetings" }` ×3 | `m1`, `m2`, `m3` |
-| 3 | `lesson.create` | `{ moduleId: m1, title: "Hola and Hello" }` | `l1` |
-| 4 | `flowStep.create` | `{ lessonId: l1, title: "Morning", content: "Buenos días means…", step_type: "message", is_starting_step: true }` | `s1` |
-| 5 | `flowStep.create` ×2 | `{ lessonId: l1, title: "Afternoon" / "Evening", step_type: "message" }` | `s2`, `s3` |
-| 6 | `flowStep.create` | `{ lessonId: l1, title: "Quick check", step_type: "quiz" }` | `s4` |
-| 7 | `connection.add` | `{ flowStepId: s1, to_step_id: s2, button_text: "Next", button_order: 1 }` ×3 | wires `s1→s2→s3→s4` |
-| 8 | `lesson.update` | `{ lessonId: l1, flow_completed: true }` | required for publish |
-| 9 | `course.update` | `{ courseId: c1, status: "published" }` | live |
+| 1 | `flowlearn_course_create` | `{ title: "Beginner Spanish for Travelers", topic: "Spanish for travel" }` | `entity.id = c1` |
+| 2 | `flowlearn_module_create` | `{ course_id: c1, title: "Greetings" }` ×3 | `m1`, `m2`, `m3` |
+| 3 | `flowlearn_lesson_create` | `{ module_id: m1, title: "Hola and Hello" }` | `l1` |
+| 4 | `flowlearn_flow_step_create` | `{ lesson_id: l1, title: "Morning", content: "Buenos días means…", step_type: "message", is_starting_step: true }` | `s1` |
+| 5 | `flowlearn_flow_step_create` ×2 | `{ lesson_id: l1, title: "Afternoon" / "Evening", step_type: "message" }` | `s2`, `s3` |
+| 6 | `flowlearn_flow_step_create` | `{ lesson_id: l1, title: "Quick check", step_type: "quiz" }` | `s4` |
+| 7 | `flowlearn_connection_add` | `{ flow_step_id: s1, to_step_id: s2, button_text: "Next", button_order: 1 }` ×3 | wires `s1→s2→s3→s4` |
+| 8 | `flowlearn_lesson_update` | `{ lesson_id: l1, flow_completed: true }` | required for publish |
+| 9 | `flowlearn_course_update` | `{ course_id: c1, status: "published" }` | live |
 
-**Where do IDs come from?** Either from the return value of the previous create call, or from `course.list` / `module.list` / `lesson.list` / `flowStep.list` when working against an existing course.
+**Where do IDs come from?** Either from `entity.id` of the previous create call, or from `flowlearn_course_list` / `flowlearn_module_list` / `flowlearn_lesson_list` / `flowlearn_flow_step_list` when working against an existing course.
 
 ## Reference — enum values and JSON shapes
 
-Pulled from the Flowlearn codebase, not invented.
+Pulled from the Flowlearn codebase, not invented. Also available at runtime via `flowlearn_help { topic: "enums" }`.
 
-### `flowStep.step_type`
+### `flow_step.step_type`
 `"message" | "quiz" | "exercise"` — enforced by a DB CHECK constraint. Defaults to `"message"` server-side.
 
 ### `connection.button_action`
@@ -228,11 +244,11 @@ Only field the rest of the codebase reads.
 ```ts
 { steps: any[] }
 ```
-The live flow lives in `flow_steps` + `flow_connections` (managed via `flowStep.*` and `connection.*` tools); the lesson's `content.steps` is a legacy/snapshot field. Usually leave it empty.
+The live flow lives in `flow_steps` + `flow_connections` (managed via `flowlearn_flow_step_*` and `flowlearn_connection_*` tools); the lesson's `content.steps` is a legacy/snapshot field. Usually leave it empty.
 
 ## Publishing rules
 
-`course.update` with `status: "published"` is rejected unless the course meets the publishing rules from `lib/validations/course-publish.ts`. The API returns either `400` (blocked) or `200` with `requiresConfirmation: true` (warning).
+`flowlearn_course_update` with `status: "published"` is rejected unless the course meets the publishing rules. The API returns either `400` (blocked) or `200` with `requiresConfirmation: true` (warning) inside `entity`.
 
 **Hard blocks:**
 - The course has zero modules.
@@ -240,11 +256,11 @@ The live flow lives in `flow_steps` + `flow_connections` (managed via `flowStep.
 - A module has gaps in lesson completion (later lessons complete, earlier ones not) while later modules have content.
 - A module is empty while later modules have completed lessons.
 
-**Warnings (require `forcePublish: true` to override):**
+**Warnings (require `force_publish: true` to override):**
 - Trailing modules are empty.
 - A module is partially complete (some lessons done, some not).
 
-**To publish cleanly:** every module has at least one lesson with `flow_completed = true`, in order, no gaps. Set `flow_completed` on a lesson with `lesson.update`.
+**To publish cleanly:** every module has at least one lesson with `flow_completed = true`, in order, no gaps. Set `flow_completed` on a lesson with `flowlearn_lesson_update`.
 
 ## Tests
 
@@ -272,4 +288,4 @@ Every request includes `x-tenant-slug: <FLOWLEARN_TENANT_SLUG>`. The Flowlearn m
 
 ## Errors
 
-Tool failures are returned as MCP tool errors (`isError: true`) with the upstream HTTP status, the failing path, and the response body. Connection failures and config errors are written to stderr and exit the process so Claude Desktop / Claude Code reports them in its server panel.
+Tool failures are returned as MCP tool errors (`isError: true`) with a structured envelope: `{ code, message, suggestion?, retriable, details? }`. Common codes: `FLOWLEARN_API_4xx/5xx` (upstream), `INVALID_ARGUMENTS` (Zod), `INVALID_TENANT` / `NOT_ADMIN` (setup), `UNKNOWN_TOOL` (typo or pre-v0.2.0 dotted name). Connection failures and config errors are written to stderr and exit the process so Claude Desktop / Claude Code reports them in its server panel.

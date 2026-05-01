@@ -56,8 +56,8 @@ def main() -> int:
     client = McpClient(SERVER_ENTRY, env)
     try:
         print(f"Deleting course {course_id}...")
-        result = client.call_tool("course.delete", {"courseId": course_id})
-        print(f"course.delete result: {result}")
+        result = client.call_tool("flowlearn_course_delete", {"course_id": course_id})
+        print(f"flowlearn_course_delete result: {result}")
     finally:
         client.close()
 
