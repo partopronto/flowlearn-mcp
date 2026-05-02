@@ -2,15 +2,16 @@ import { z } from "zod";
 import type { FlowlearnClient } from "../client.js";
 import {
   DryRunField,
+  IdSchema,
   IdempotencyField,
   PaginationFields,
   editorUrl,
   entityResult,
   errorResult,
-  getIdempotent,
+  getIdempotentScoped,
   listResult,
   paginate,
-  setIdempotent,
+  setIdempotentScoped,
   type ToolDef,
 } from "./common.js";
 
@@ -55,7 +56,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "module_id": "mod_x" }\n\n' +
         "Errors: FLOWLEARN_API_404 if module_id invalid.",
       inputSchema: {
-        module_id: z.string().min(1),
+        module_id: IdSchema,
         ...PaginationFields,
       },
       outputSchema: LessonListEnvelope,
@@ -89,7 +90,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "lesson_id": "lsn_abc" }\n\n' +
         "Errors: FLOWLEARN_API_404 if lesson_id invalid.",
       inputSchema: {
-        lesson_id: z.string().min(1),
+        lesson_id: IdSchema,
       },
       outputSchema: LessonEnvelope,
       annotations: {
@@ -100,6 +101,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ lesson_id }) => {
+        const tenantSlug = cfg().tenantSlug;
         const data = await client.request<{ lesson?: Record<string, unknown> }>(
           `/api/lessons/${lesson_id}`,
         );
@@ -108,7 +110,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         return entityResult({
           entity,
           summary: `Lesson '${entity.title}' (id=${id}), flow_completed=${entity.flow_completed ?? false}.`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "lesson", id),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "lesson", id),
           resource_uri: `flowlearn://lesson/${id}`,
           next_actions: [
             `flowlearn_flow_step_list with lesson_id="${id}" to see the flow`,
@@ -127,12 +129,12 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "module_id": "mod_x", "title": "Hello" }\n\n' +
         "Errors: FLOWLEARN_API_404 if module_id invalid.",
       inputSchema: {
-        module_id: z.string().min(1),
+        module_id: IdSchema,
         title: z.string().min(1),
         description: z.string().optional(),
         content: z
           .object({ steps: z.array(z.unknown()).optional() })
-          .passthrough()
+          .strict()
           .optional()
           .describe("Usually leave empty and use flowlearn_flow_step_create"),
         ...IdempotencyField,
@@ -146,7 +148,8 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ module_id, client_request_id, ...body }) => {
-        const cached = getIdempotent(client_request_id as string | undefined);
+        const tenantSlug = cfg().tenantSlug;
+        const cached = getIdempotentScoped(tenantSlug, client_request_id as string | undefined);
         if (cached) return cached;
         const data = await client.request<{ lesson?: Record<string, unknown> }>(
           `/api/modules/${module_id}/lessons`,
@@ -157,13 +160,13 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         const result = entityResult({
           entity,
           summary: `Created lesson '${entity.title}' (id=${id}) in module ${module_id}.`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "lesson", id),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "lesson", id),
           resource_uri: `flowlearn://lesson/${id}`,
           next_actions: [
             `flowlearn_flow_step_create with lesson_id="${id}" + is_starting_step=true to add the entry step`,
           ],
         });
-        setIdempotent(client_request_id as string | undefined, result);
+        setIdempotentScoped(tenantSlug, client_request_id as string | undefined, result);
         return result;
       },
     },
@@ -176,12 +179,12 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "lesson_id": "lsn_abc", "flow_completed": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if lesson_id invalid.",
       inputSchema: {
-        lesson_id: z.string().min(1),
+        lesson_id: IdSchema,
         title: z.string().optional(),
         description: z.string().optional(),
         content: z
           .object({ steps: z.array(z.unknown()).optional() })
-          .passthrough()
+          .strict()
           .optional(),
         flow_completed: z.boolean().optional(),
       },
@@ -194,6 +197,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ lesson_id, ...body }) => {
+        const tenantSlug = cfg().tenantSlug;
         const data = await client.request<{ lesson?: Record<string, unknown> }>(
           `/api/lessons/${lesson_id}`,
           { method: "PUT", body },
@@ -203,7 +207,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         return entityResult({
           entity,
           summary: `Updated lesson '${entity.title}' (id=${id}).`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "lesson", id),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "lesson", id),
           resource_uri: `flowlearn://lesson/${id}`,
         });
       },
@@ -218,7 +222,7 @@ export function buildLessonTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "lesson_id": "lsn_abc", "dry_run": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if lesson_id invalid.",
       inputSchema: {
-        lesson_id: z.string().min(1),
+        lesson_id: IdSchema,
         ...DryRunField,
       },
       outputSchema: z.object({

@@ -197,6 +197,30 @@ export function setIdempotent(key: string | undefined, result: ToolResult): void
 }
 
 /**
+ * Snapshot-scoped variants. Use these when a handler awaits anything between
+ * the lookup and the write (e.g. an upstream POST). They take an explicit
+ * tenant scope captured at handler entry, so a concurrent
+ * flowlearn_setup_switch_tenant cannot park a tenant-A entity into
+ * tenant-B's cache scope while the create is in flight.
+ */
+export function getIdempotentScoped(
+  scope: string,
+  key: string | undefined,
+): ToolResult | undefined {
+  if (!key) return undefined;
+  return idempotencyCache.get(`${scope}::${key}`);
+}
+
+export function setIdempotentScoped(
+  scope: string,
+  key: string | undefined,
+  result: ToolResult,
+): void {
+  if (!key) return;
+  idempotencyCache.set(`${scope}::${key}`, result);
+}
+
+/**
  * Apply MCP-side pagination to an array. Cursor is a base64-encoded numeric
  * offset, future-proofed against API change. response_format=concise strips
  * the items down to {id, title} (best-effort) for cheap iteration.
@@ -235,6 +259,36 @@ function decodeCursor(cursor: string | undefined): number {
     return Number.isFinite(n) && n >= 0 ? n : 0;
   } catch {
     return 0;
+  }
+}
+
+/**
+ * Strict ID validator. Flowlearn IDs are short opaque tokens (e.g. `crs_abc123`,
+ * `mod_xyz`, `stp_a1b2c3`); they never contain `/`, `..`, whitespace, or
+ * control characters. Enforcing the shape at the schema boundary closes the
+ * path-traversal vector where an unencoded ID is interpolated into an upstream
+ * URL like `/api/courses/${course_id}` — without this, a value like
+ * `../register/memberships` reroutes the call to a different authenticated
+ * endpoint under the user's session cookie.
+ */
+export const ID_REGEX = /^[A-Za-z0-9_-]{1,128}$/;
+export const IdSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(ID_REGEX, "must be alphanumeric/underscore/hyphen only, max 128 chars");
+export const NullableIdSchema = IdSchema.nullable();
+
+/**
+ * Defence-in-depth: validate an id at runtime (e.g. after `decodeURIComponent`
+ * in resource handlers) before interpolating into an upstream path.
+ * Throws if the id is not safe.
+ */
+export function assertSafeId(id: string, label = "id"): void {
+  if (!ID_REGEX.test(id)) {
+    throw new Error(
+      `Invalid ${label}: must match ${ID_REGEX} (alphanumeric/_/- only, max 128 chars).`,
+    );
   }
 }
 

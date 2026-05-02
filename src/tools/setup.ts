@@ -13,6 +13,23 @@ import {
 
 const ADMIN_ROLES = ["tenant_admin", "creator", "super_admin"] as const;
 
+/**
+ * Schema-level character refinement for fields persisted to .env / JSON.
+ * Closes the env-injection vector by rejecting CR / LF / NUL at the API
+ * boundary, before any disk write.
+ *
+ * Length is bounded explicitly per call site (z.string().max(N)) so refine()
+ * sits at the END of the chain and the result remains a ZodString-compatible
+ * type for the caller to .pipe() into stricter validators (e.g. .email()).
+ */
+function noControlChars(s: z.ZodString, label: string): z.ZodEffects<z.ZodString, string, string> {
+  return s.refine((v) => !/[\r\n\0]/.test(v), {
+    message: `${label} must not contain newlines or null bytes`,
+  });
+}
+
+const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
 type Membership = {
   tenant_id: string;
   slug: string;
@@ -41,10 +58,30 @@ type WritePlan = {
   previous: string | null;
 };
 
+/**
+ * Reject any value containing characters that would let an injected payload
+ * break out of a single .env line (newlines), corrupt key/value parsing
+ * (`\0`), or escape JSON escaping in surprising ways. Belt-and-braces with
+ * the schema-level refinement on the input fields below; the function exists
+ * so any future call site that bypasses the schema still cannot land a
+ * malicious value on disk.
+ */
+function assertSafeEnvValue(key: string, value: string): void {
+  if (/[\r\n\0]/.test(value)) {
+    throw new Error(
+      `Refusing to write ${key}: value contains a newline or null byte. ` +
+        `Such values would split into multiple .env lines and could inject ` +
+        `additional environment variables on next load.`,
+    );
+  }
+}
+
 function planEnvFileUpdate(
   path: string,
   updates: Record<string, string>,
 ): WritePlan {
+  for (const [k, v] of Object.entries(updates)) assertSafeEnvValue(k, v);
+
   const previous = existsSync(path) ? readFileSync(path, "utf-8") : null;
   const lines = previous != null ? previous.split(/\r?\n/) : [];
 
@@ -76,6 +113,8 @@ function planClaudeMcpEnvUpdate(
   serverName: string,
   updates: Record<string, string>,
 ): WritePlan {
+  for (const [k, v] of Object.entries(updates)) assertSafeEnvValue(k, v);
+
   if (!existsSync(CLAUDE_CONFIG_PATH)) {
     throw new Error(
       `${CLAUDE_CONFIG_PATH} does not exist. Cannot update MCP credentials before initial registration.`,
@@ -152,16 +191,18 @@ async function validateCredentials(
     body: JSON.stringify({ email, password }),
   });
   if (!res.ok) {
-    const body = await res.text();
+    // Drain the body to keep the connection clean, but never echo it back to
+    // the caller — it may contain reflected request fields, and an
+    // attacker-controlled "upstream" (post any baseUrl flip) could echo the
+    // submitted password verbatim.
+    await res.text().catch(() => "");
     if (res.status === 401) {
       throw new Error(
-        `New credentials rejected (401). The current setup is unchanged. ` +
-          `Body: ${body}`,
+        "New credentials rejected (401). The current setup is unchanged.",
       );
     }
     throw new Error(
-      `New credentials check failed with HTTP ${res.status}. ` +
-        `The current setup is unchanged. Body: ${body}`,
+      `New credentials check failed with HTTP ${res.status}. The current setup is unchanged.`,
     );
   }
 }
@@ -273,6 +314,7 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
         slug: z
           .string()
           .min(1)
+          .max(63)
           .describe("Slug of one of your admin-role tenants"),
       },
       outputSchema: z.object({
@@ -296,6 +338,19 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
       },
       handler: async ({ slug }) => {
         const newSlug = String(slug).toLowerCase();
+        // Defence in depth: even though we only ACCEPT a slug that matches a
+        // real membership, refuse anything that isn't a valid slug shape
+        // before the membership lookup. Mirrors flowlearn server-side
+        // constraints and prevents log/header smuggling via odd characters.
+        if (!SLUG_REGEX.test(newSlug)) {
+          return errorResult({
+            code: "INVALID_TENANT",
+            message: `'${newSlug}' is not a valid tenant slug shape.`,
+            suggestion:
+              "Slugs are lowercase alphanumeric with hyphens (e.g. 'acme', 'big-corp'); 1-63 characters; cannot start with a hyphen.",
+            retriable: false,
+          });
+        }
         const cfg = client.getConfig();
         const previousSlug = cfg.tenantSlug;
 
@@ -355,11 +410,9 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "slug": "newtenant" }\n\n' +
         "Errors: validation_failed (creds rejected); INVALID_TENANT (slug not in memberships); NOT_ADMIN (slug role insufficient).",
       inputSchema: {
-        email: z.string().email().optional(),
-        password: z.string().min(1).optional(),
-        slug: z
-          .string()
-          .min(1)
+        email: noControlChars(z.string().min(1).max(254).email(), "email").optional(),
+        password: noControlChars(z.string().min(1).max(1024), "password").optional(),
+        slug: noControlChars(z.string().min(1).max(63), "slug")
           .optional()
           .describe("Lowercased; must be an admin-role tenant"),
       },
@@ -399,6 +452,16 @@ export function buildSetupTools(client: FlowlearnClient): ToolDef[] {
         const newEmail = (email as string | undefined) ?? cfg.email;
         const newPassword = (password as string | undefined) ?? cfg.password;
         const newSlug = slug ? String(slug).toLowerCase() : cfg.tenantSlug;
+
+        if (slug && !SLUG_REGEX.test(newSlug)) {
+          return errorResult({
+            code: "INVALID_TENANT",
+            message: `'${newSlug}' is not a valid tenant slug shape.`,
+            suggestion:
+              "Slugs are lowercase alphanumeric with hyphens (e.g. 'acme'); 1-63 characters; cannot start with a hyphen.",
+            retriable: false,
+          });
+        }
 
         await validateCredentials(cfg.baseUrl, newEmail, newPassword);
 

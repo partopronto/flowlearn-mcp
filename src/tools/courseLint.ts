@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { FlowlearnClient } from "../client.js";
-import { entityResult, type ToolDef } from "./common.js";
+import { IdSchema, entityResult, type ToolDef } from "./common.js";
 
 /**
  * Read-only quality / publish-readiness audit for a course. The agent calls
@@ -52,7 +52,7 @@ export function buildCourseLintTools(client: FlowlearnClient): ToolDef[] {
         "Filter by severity client-side; the response always includes both. publish_ready is a single boolean for quick gating.\n\n" +
         "Errors: FLOWLEARN_API_404 if course_id invalid.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
       },
       outputSchema: LintEnvelope,
       annotations: {

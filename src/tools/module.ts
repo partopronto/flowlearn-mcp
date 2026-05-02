@@ -2,15 +2,16 @@ import { z } from "zod";
 import type { FlowlearnClient } from "../client.js";
 import {
   DryRunField,
+  IdSchema,
   IdempotencyField,
   PaginationFields,
   editorUrl,
   entityResult,
   errorResult,
-  getIdempotent,
+  getIdempotentScoped,
   listResult,
   paginate,
-  setIdempotent,
+  setIdempotentScoped,
   type ToolDef,
 } from "./common.js";
 
@@ -54,7 +55,7 @@ export function buildModuleTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "course_id": "crs_abc", "response_format": "concise" }\n\n' +
         "Errors: FLOWLEARN_API_404 if course_id is invalid.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
         ...PaginationFields,
       },
       outputSchema: ModuleListEnvelope,
@@ -90,12 +91,12 @@ export function buildModuleTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "course_id": "crs_abc", "title": "Greetings", "content": { "objectives": ["Say hello", "Say goodbye"] } }\n\n' +
         "Errors: FLOWLEARN_API_404 if course_id invalid; FLOWLEARN_API_400 on missing title.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
         title: z.string().min(1),
         description: z.string().optional(),
         content: z
           .object({ objectives: z.array(z.string()).optional() })
-          .passthrough()
+          .strict()
           .optional()
           .describe("Shape: { objectives: string[] }"),
         ...IdempotencyField,
@@ -109,7 +110,8 @@ export function buildModuleTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ course_id, client_request_id, ...body }) => {
-        const cached = getIdempotent(client_request_id as string | undefined);
+        const tenantSlug = cfg().tenantSlug;
+        const cached = getIdempotentScoped(tenantSlug, client_request_id as string | undefined);
         if (cached) return cached;
         const data = await client.request<{ module?: Record<string, unknown> }>(
           `/api/courses/${course_id}/modules`,
@@ -120,12 +122,12 @@ export function buildModuleTools(client: FlowlearnClient): ToolDef[] {
         const result = entityResult({
           entity,
           summary: `Created module '${entity.title}' (id=${id}) in course ${course_id}.`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "module", id, { courseId: String(course_id) }),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "module", id, { courseId: String(course_id) }),
           next_actions: [
             `flowlearn_lesson_create with module_id="${id}" to add lessons`,
           ],
         });
-        setIdempotent(client_request_id as string | undefined, result);
+        setIdempotentScoped(tenantSlug, client_request_id as string | undefined, result);
         return result;
       },
     },
@@ -139,12 +141,12 @@ export function buildModuleTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "module_id": "mod_x", "title": "Greetings 101", "content": { "objectives": ["..."] } }\n\n' +
         "Errors: FLOWLEARN_API_404 if module_id invalid.",
       inputSchema: {
-        module_id: z.string().min(1),
+        module_id: IdSchema,
         title: z.string().optional(),
         description: z.string().optional(),
         content: z
           .object({ objectives: z.array(z.string()).optional() })
-          .passthrough()
+          .strict()
           .optional(),
       },
       outputSchema: ModuleEnvelope,
@@ -179,7 +181,7 @@ export function buildModuleTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "module_id": "mod_x", "dry_run": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if module_id invalid.",
       inputSchema: {
-        module_id: z.string().min(1),
+        module_id: IdSchema,
         ...DryRunField,
       },
       outputSchema: z.object({
@@ -232,9 +234,9 @@ export function buildModuleTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "course_id": "crs_abc", "modules": [{"id":"mod_x","order_index":0},{"id":"mod_y","order_index":1}] }\n\n' +
         "Errors: FLOWLEARN_API_400 if any id doesn't belong to course_id.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
         modules: z
-          .array(z.object({ id: z.string(), order_index: z.number().int() }))
+          .array(z.object({ id: IdSchema, order_index: z.number().int() }).strict())
           .min(1),
       },
       outputSchema: z.object({

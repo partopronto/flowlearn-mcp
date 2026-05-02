@@ -3,15 +3,16 @@ import type { FlowlearnClient } from "../client.js";
 import { FLOWLEARN_BASE_URL } from "../config.js";
 import {
   DryRunField,
+  IdSchema,
   IdempotencyField,
   PaginationFields,
   editorUrl,
   entityResult,
   errorResult,
-  getIdempotent,
+  getIdempotentScoped,
   listResult,
   paginate,
-  setIdempotent,
+  setIdempotentScoped,
   type ToolDef,
 } from "./common.js";
 
@@ -88,7 +89,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "course_id": "crs_abc123" }\n\n' +
         "Errors: FLOWLEARN_API_404 if id is invalid — call flowlearn_course_list to enumerate valid ids.",
       inputSchema: {
-        course_id: z.string().min(1).describe("UUID or slug of the course"),
+        course_id: IdSchema.describe("UUID or slug of the course"),
       },
       outputSchema: CourseEnvelope,
       annotations: {
@@ -99,6 +100,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ course_id }) => {
+        const tenantSlug = cfg().tenantSlug;
         const data = await client.request<{ course?: Record<string, unknown> }>(
           `/api/courses/${course_id}`,
         );
@@ -107,7 +109,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         return entityResult({
           entity,
           summary: `Course '${entity.title}' (id=${id}), status=${entity.status}.`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "course", id),
           resource_uri: `flowlearn://course/${id}`,
           next_actions: [
             `flowlearn_module_list with course_id="${id}" to list modules`,
@@ -145,7 +147,8 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ client_request_id, ...body }) => {
-        const cached = getIdempotent(client_request_id as string | undefined);
+        const tenantSlug = cfg().tenantSlug;
+        const cached = getIdempotentScoped(tenantSlug, client_request_id as string | undefined);
         if (cached) return cached;
         const data = await client.request<{ course?: Record<string, unknown> }>(
           "/api/courses",
@@ -156,14 +159,14 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         const result = entityResult({
           entity,
           summary: `Created draft course '${entity.title}' (id=${id}).`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "course", id),
           resource_uri: `flowlearn://course/${id}`,
           next_actions: [
             `flowlearn_module_create with course_id="${id}" to add the first module`,
             `flowlearn_course_update with course_id="${id}" to set goal/tone`,
           ],
         });
-        setIdempotent(client_request_id as string | undefined, result);
+        setIdempotentScoped(tenantSlug, client_request_id as string | undefined, result);
         return result;
       },
     },
@@ -177,7 +180,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "course_id": "crs_abc", "status": "published", "force_publish": true }\n\n' +
         "Errors: FLOWLEARN_API_400 with body listing the unmet rules; call flowlearn_course_get + flowlearn_module_list to inspect.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
         title: z.string().optional(),
         description: z.string().optional(),
         topic: z.string().optional(),
@@ -205,6 +208,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ course_id, force_publish, ...body }) => {
+        const tenantSlug = cfg().tenantSlug;
         const payload: Record<string, unknown> = { ...body };
         if (force_publish !== undefined) payload.forcePublish = force_publish;
         const data = await client.request<Record<string, unknown>>(
@@ -219,12 +223,12 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
           summary: data.requiresConfirmation
             ? `Update returned requiresConfirmation — re-call with force_publish=true to override.`
             : `Updated course '${entity.title}' (id=${id}), status=${status}.`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "course", id),
           resource_uri: `flowlearn://course/${id}`,
           next_actions: data.requiresConfirmation
             ? [`flowlearn_course_update again with force_publish=true`]
             : status === "published"
-              ? [`Course is live at ${editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id)}`]
+              ? [`Course is live at ${editorUrl(cfg().baseUrl, tenantSlug, "course", id)}`]
               : [`flowlearn_course_get with course_id="${id}" to verify`],
         });
         // Surface requiresConfirmation/validation at the envelope ROOT — they
@@ -255,7 +259,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "course_id": "crs_abc", "dry_run": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if course_id invalid.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
         ...DryRunField,
       },
       outputSchema: CourseEnvelope,
@@ -267,6 +271,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ course_id, dry_run }) => {
+        const tenantSlug = cfg().tenantSlug;
         if (dry_run) {
           try {
             const preview = await client.request<{ course?: Record<string, unknown> }>(
@@ -296,7 +301,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         return entityResult({
           entity,
           summary: `Unpublished course '${entity.title}' (id=${id}); status is now draft.`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", id),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "course", id),
           resource_uri: `flowlearn://course/${id}`,
           next_actions: [
             `flowlearn_course_update with course_id="${id}" + status="published" to re-publish when ready`,
@@ -317,7 +322,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "source_course_id": "crs_abc", "new_title": "Spanish Greetings v2" }\n\n' +
         "Errors: FLOWLEARN_API_404 if source_course_id invalid; FLOWLEARN_API_* on any sub-create.",
       inputSchema: {
-        source_course_id: z.string().min(1),
+        source_course_id: IdSchema,
         new_title: z
           .string()
           .min(1)
@@ -335,6 +340,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ source_course_id, new_title, client_request_id, dry_run }) => {
+        const tenantSlug = cfg().tenantSlug;
         // Walk the source tree.
         let sourceCourse: Record<string, unknown>;
         try {
@@ -438,7 +444,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
           });
         }
 
-        const cached = getIdempotent(client_request_id as string | undefined);
+        const cached = getIdempotentScoped(tenantSlug, client_request_id as string | undefined);
         if (cached) return cached;
 
         // Build the copy. Track the new course id for rollback.
@@ -540,14 +546,14 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
           const result = entityResult({
             entity: { ...newCourse, title: targetTitle },
             summary: `Duplicated course '${sourceCourse.title}' (id=${source_course_id}) as '${targetTitle}' (id=${newCourseId}) with ${plan.length} modules, ${lessonCount} lessons, ${stepCount} steps, ${connCount} connections. Images were NOT copied.`,
-            url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", newCourseId),
+            url: editorUrl(cfg().baseUrl, tenantSlug, "course", newCourseId),
             resource_uri: `flowlearn://course/${newCourseId}`,
             next_actions: [
               `flowlearn_course_get with course_id="${newCourseId}" to inspect`,
               `flowlearn_flow_step_upload_image to re-attach images on the new steps`,
             ],
           });
-          setIdempotent(client_request_id as string | undefined, result);
+          setIdempotentScoped(tenantSlug, client_request_id as string | undefined, result);
           return result;
         } catch (err) {
           if (newCourseId) {
@@ -584,7 +590,7 @@ export function buildCourseTools(client: FlowlearnClient): ToolDef[] {
         '             { "course_id": "crs_abc" }                    → delete\n\n' +
         "Errors: FLOWLEARN_API_404 if id invalid; FLOWLEARN_API_403 if active tenant lacks delete role.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
         ...DryRunField,
       },
       outputSchema: z.object({

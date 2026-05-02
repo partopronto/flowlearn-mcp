@@ -179,9 +179,18 @@ async function main(): Promise<void> {
       return await tool.handler(parsed.data);
     } catch (err) {
       if (err instanceof FlowlearnApiError) {
+        // Log the full upstream body to stderr for operator-side debugging,
+        // but never return it to the caller. Error bodies can carry
+        // reflected request fields (incl. the submitted password), session
+        // identifiers, or other tenant data that the agent shouldn't see.
+        process.stderr.write(
+          `flowlearn-mcp upstream error ${err.status} on ${err.path}: ${
+            typeof err.body === "string" ? err.body : JSON.stringify(err.body)
+          }\n`,
+        );
         return errorResult({
           code: `FLOWLEARN_API_${err.status}`,
-          message: err.message,
+          message: `Upstream Flowlearn API returned ${err.status} on ${err.path}.`,
           suggestion:
             err.status === 401
               ? "Auth failed despite a refresh attempt. Verify FLOWLEARN_EMAIL/PASSWORD and tenant membership."
@@ -193,7 +202,7 @@ async function main(): Promise<void> {
                     ? "Upstream Flowlearn error. Retrying may help."
                     : undefined,
           retriable: err.status >= 500 || err.status === 401,
-          details: { status: err.status, path: err.path, body: err.body },
+          details: { status: err.status, path: err.path },
         });
       }
       const message = err instanceof Error ? err.message : String(err);

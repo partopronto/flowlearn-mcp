@@ -1,5 +1,6 @@
 import type { FlowlearnClient } from "./client.js";
 import { HELP_TOPICS, type HelpTopic } from "./tools/help.js";
+import { ID_REGEX } from "./tools/common.js";
 
 /**
  * MCP resource layer for flowlearn-mcp.
@@ -126,6 +127,14 @@ export async function readResource(
     }
 
     case "course": {
+      // Defence in depth: parsed.id has already been decodeURIComponent'd.
+      // Reject anything that isn't a flowlearn-shaped id before we
+      // interpolate it into an upstream URL — otherwise a URI like
+      // flowlearn://course/..%2Fauth%2Fsign-in%2Femail would reroute the
+      // call to a different authenticated endpoint.
+      if (!ID_REGEX.test(parsed.id)) {
+        throw new ResourceNotFoundError(`Invalid course id: '${parsed.id}'.`);
+      }
       const data = await client.request<unknown>(`/api/courses/${parsed.id}`);
       return [
         { uri, mimeType: "application/json", text: JSON.stringify(data, null, 2) },
@@ -133,6 +142,9 @@ export async function readResource(
     }
 
     case "lesson": {
+      if (!ID_REGEX.test(parsed.id)) {
+        throw new ResourceNotFoundError(`Invalid lesson id: '${parsed.id}'.`);
+      }
       const [lesson, steps] = await Promise.all([
         client.request<unknown>(`/api/lessons/${parsed.id}`),
         client.request<unknown>(`/api/lessons/${parsed.id}/flow-steps`),

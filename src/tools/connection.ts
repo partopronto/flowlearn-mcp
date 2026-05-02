@@ -2,14 +2,15 @@ import { z } from "zod";
 import type { FlowlearnClient } from "../client.js";
 import {
   DryRunField,
+  IdSchema,
   IdempotencyField,
   PaginationFields,
   entityResult,
   errorResult,
-  getIdempotent,
+  getIdempotentScoped,
   listResult,
   paginate,
-  setIdempotent,
+  setIdempotentScoped,
   type ToolDef,
 } from "./common.js";
 
@@ -51,7 +52,7 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_abc" }\n\n' +
         "Errors: FLOWLEARN_API_404 if flow_step_id invalid.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
+        flow_step_id: IdSchema,
         ...PaginationFields,
       },
       outputSchema: ConnectionListEnvelope,
@@ -86,9 +87,8 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_a", "to_step_id": "stp_b", "button_text": "Next", "button_action": "next", "button_order": 1 }\n\n' +
         "Errors: FLOWLEARN_API_404 if flow_step_id or to_step_id invalid.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
-        to_step_id: z
-          .string()
+        flow_step_id: IdSchema,
+        to_step_id: IdSchema
           .nullable()
           .describe("Null for terminal buttons (end of flow)"),
         button_text: z.string().min(1),
@@ -107,7 +107,8 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ flow_step_id, client_request_id, ...body }) => {
-        const cached = getIdempotent(client_request_id as string | undefined);
+        const tenantSlug = client.getConfig().tenantSlug;
+        const cached = getIdempotentScoped(tenantSlug, client_request_id as string | undefined);
         if (cached) return cached;
         const data = await client.request<{ connection?: Record<string, unknown> }>(
           `/api/flow-steps/${flow_step_id}/connections`,
@@ -118,7 +119,7 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
           entity,
           summary: `Added button '${body.button_text}' from step ${flow_step_id} → ${body.to_step_id ?? "(terminal)"}.`,
         });
-        setIdempotent(client_request_id as string | undefined, result);
+        setIdempotentScoped(tenantSlug, client_request_id as string | undefined, result);
         return result;
       },
     },
@@ -132,15 +133,15 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_a", "connections": [{"to_step_id":"stp_b","button_text":"Yes","button_order":1},{"to_step_id":"stp_c","button_text":"No","button_order":2}] }\n\n' +
         "Errors: USE_CONNECTION_CLEAR if connections=[] (call flowlearn_connection_clear instead); FLOWLEARN_API_404 if any to_step_id invalid.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
+        flow_step_id: IdSchema,
         connections: z
           .array(
             z.object({
-              to_step_id: z.string().nullable(),
+              to_step_id: IdSchema.nullable(),
               button_text: z.string().min(1),
               button_action: ButtonActionEnum.optional(),
               button_order: z.number().int().min(1),
-            }),
+            }).strict(),
           )
           .min(0),
         ...DryRunField,
@@ -203,22 +204,19 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "lesson_id": "les_abc", "edges": [{"from_flow_step_id":"stp_1","to_flow_step_id":"stp_2","button_text":"Next","button_order":1},{"from_flow_step_id":"stp_2","to_flow_step_id":null,"button_text":"Finish","button_order":1}] }\n\n' +
         "Errors: INVALID_ARGUMENTS if any step id is cross-lesson; FLOWLEARN_API_404 if lesson_id invalid. On partial failure: GRAPH_REPLACE_PARTIAL with details.partial.",
       inputSchema: {
-        lesson_id: z.string().min(1).describe("ID of the lesson whose flow graph to replace"),
+        lesson_id: IdSchema.describe("ID of the lesson whose flow graph to replace"),
         edges: z
           .array(
             z.object({
-              from_flow_step_id: z
-                .string()
-                .min(1)
+              from_flow_step_id: IdSchema
                 .describe("The step that has this outgoing button (must be in this lesson)"),
-              to_flow_step_id: z
-                .string()
+              to_flow_step_id: IdSchema
                 .nullable()
                 .describe("Target step (must be in this lesson), or null for terminal buttons"),
               button_text: z.string().min(1).describe("Button label"),
               button_action: ButtonActionEnum.optional().describe("Defaults to 'next'"),
               button_order: z.number().int().min(1).describe("Display order among buttons on this step"),
-            }),
+            }).strict(),
           )
           .describe("Complete desired edge list for the lesson"),
         ...DryRunField,
@@ -387,7 +385,7 @@ export function buildConnectionTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_a", "dry_run": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if flow_step_id invalid.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
+        flow_step_id: IdSchema,
         ...DryRunField,
       },
       outputSchema: z.object({

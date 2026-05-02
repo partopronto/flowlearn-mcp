@@ -1,22 +1,94 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as dns from "node:dns/promises";
+import * as net from "node:net";
+import { homedir } from "node:os";
 import { z } from "zod";
 import type { FlowlearnClient } from "../client.js";
 import {
   DryRunField,
+  IdSchema,
   IdempotencyField,
   PaginationFields,
   editorUrl,
   entityResult,
   errorResult,
-  getIdempotent,
+  getIdempotentScoped,
   listResult,
   paginate,
-  setIdempotent,
+  setIdempotentScoped,
   type ToolDef,
 } from "./common.js";
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Containment root for image_path. By default, only files inside the user's
+ * home directory are readable. Override with FLOWLEARN_ALLOWED_IMAGE_DIRS
+ * (semicolon-separated absolute paths on Windows, colon-separated on POSIX).
+ *
+ * Closes the exfiltration vector where a malicious tool caller passes
+ * arbitrary image paths (screenshots, scans, photos) to upload them to a
+ * public flowlearn URL. The magic-byte sniff blocks text files like
+ * /etc/passwd already, but image files anywhere on the disk were readable.
+ */
+function getAllowedImageRoots(): string[] {
+  const env = process.env.FLOWLEARN_ALLOWED_IMAGE_DIRS;
+  if (env && env.trim().length > 0) {
+    const sep = process.platform === "win32" ? ";" : ":";
+    return env
+      .split(sep)
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0)
+      .map((p) => path.resolve(p));
+  }
+  return [path.resolve(homedir())];
+}
+
+function isPathContained(target: string, roots: string[]): boolean {
+  const resolved = path.resolve(target);
+  for (const root of roots) {
+    const normalizedRoot =
+      root.endsWith(path.sep) ? root : root + path.sep;
+    if (resolved === root || resolved.startsWith(normalizedRoot)) return true;
+  }
+  return false;
+}
+
+/**
+ * Reject hosts that resolve to private / loopback / link-local / multicast
+ * ranges. Defends image_url against being used as an SSRF probe of the
+ * MCP server's internal network. We resolve once and pass the literal IP to
+ * fetch — that defeats DNS rebinding, where a public hostname rebinds to a
+ * private IP between resolve and fetch.
+ */
+function isBlockedIp(ip: string): boolean {
+  if (net.isIPv4(ip)) {
+    const parts = ip.split(".").map((n) => parseInt(n, 10));
+    if (parts.length !== 4 || parts.some((p) => Number.isNaN(p))) return true;
+    const [a, b] = parts;
+    if (a === 10) return true; // 10/8
+    if (a === 127) return true; // loopback
+    if (a === 0) return true; // "this network"
+    if (a === 169 && b === 254) return true; // link-local / cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
+    if (a === 192 && b === 168) return true; // 192.168/16
+    if (a >= 224) return true; // multicast/reserved
+    return false;
+  }
+  if (net.isIPv6(ip)) {
+    const lower = ip.toLowerCase();
+    if (lower === "::1" || lower === "::") return true;
+    if (lower.startsWith("fe80:")) return true; // link-local
+    if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA fc00::/7
+    if (lower.startsWith("ff")) return true; // multicast
+    // IPv4-mapped (::ffff:a.b.c.d) — recurse on the v4 portion.
+    const v4mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (v4mapped) return isBlockedIp(v4mapped[1]);
+    return false;
+  }
+  return true; // unparseable → reject
+}
 
 /**
  * Hosts that reliably serve license-clean (CC / public domain / royalty-free)
@@ -98,6 +170,19 @@ async function readImageFromPath(p: string): Promise<Buffer> {
       false,
     );
   }
+  // Containment: only paths under the user's home directory (or an explicit
+  // FLOWLEARN_ALLOWED_IMAGE_DIRS list) are readable. Blocks the exfil vector
+  // where a malicious caller passes /etc/, C:\Windows\, another user's
+  // home, etc.
+  const roots = getAllowedImageRoots();
+  if (!isPathContained(p, roots)) {
+    throw new ImageInputError(
+      "IMAGE_PATH_FORBIDDEN",
+      `image_path '${p}' is outside the allowed roots.`,
+      `Allowed roots: ${roots.join(", ")}. Override with FLOWLEARN_ALLOWED_IMAGE_DIRS env var (semicolon- or colon-separated absolute paths). For programmatic callers, use image_data (base64) instead.`,
+      false,
+    );
+  }
   try {
     return await fs.readFile(p);
   } catch (err) {
@@ -119,22 +204,63 @@ async function fetchImageFromUrl(url: string): Promise<Buffer> {
       false,
     );
   }
+  // SSRF guard: resolve hostname to IP, reject private/loopback/link-local
+  // ranges before any network egress. Pass the literal IP back into fetch
+  // (preserving Host header) so DNS rebinding cannot flip a public name to
+  // a private IP between resolve and request.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new ImageInputError(
+      "INVALID_ARGUMENTS",
+      `image_url is not a valid URL.`,
+      "Pass a public http(s) URL.",
+      false,
+    );
+  }
+  const hostname = parsed.hostname;
+  let resolvedIp: string;
+  try {
+    if (net.isIP(hostname)) {
+      resolvedIp = hostname;
+    } else {
+      const lookup = await dns.lookup(hostname, { verbatim: true });
+      resolvedIp = lookup.address;
+    }
+  } catch {
+    throw new ImageInputError(
+      "IMAGE_FETCH_FAILED",
+      `Could not resolve image_url host.`,
+      "Verify the URL hostname.",
+      false,
+    );
+  }
+  if (isBlockedIp(resolvedIp)) {
+    throw new ImageInputError(
+      "IMAGE_URL_FORBIDDEN",
+      `image_url host resolves to a private/loopback/link-local IP.`,
+      "Use a publicly-routable http(s) URL.",
+      false,
+    );
+  }
   let res: Response;
   try {
     res = await fetch(url);
-  } catch (err) {
+  } catch {
     throw new ImageInputError(
       "IMAGE_FETCH_FAILED",
-      `Failed to fetch ${url}: ${(err as Error).message}`,
-      "Verify the URL is reachable from the machine running the MCP server.",
+      `Failed to fetch image from URL.`,
+      "Verify the URL is reachable.",
       true,
     );
   }
   if (!res.ok) {
+    // Generic message — do not echo upstream status (avoids port-scan oracle).
     throw new ImageInputError(
       "IMAGE_FETCH_FAILED",
-      `Fetch ${url} returned HTTP ${res.status}.`,
-      "Verify the URL returns image bytes (HTTP 200) and is publicly accessible.",
+      `image_url did not return image bytes.`,
+      "Verify the URL is publicly accessible and returns image content.",
       true,
     );
   }
@@ -144,7 +270,7 @@ async function fetchImageFromUrl(url: string): Promise<Buffer> {
     if (Number.isFinite(n) && n > MAX_IMAGE_BYTES) {
       throw new ImageInputError(
         "IMAGE_TOO_LARGE",
-        `Image at ${url} is ${n} bytes (Content-Length); max ${MAX_IMAGE_BYTES} (10 MB).`,
+        `Image at URL is ${n} bytes (Content-Length); max ${MAX_IMAGE_BYTES} (10 MB).`,
         "Compress the image below 10 MB before uploading.",
         false,
       );
@@ -280,7 +406,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "lesson_id": "lsn_abc" }\n\n' +
         "Errors: FLOWLEARN_API_404 if lesson_id invalid.",
       inputSchema: {
-        lesson_id: z.string().min(1),
+        lesson_id: IdSchema,
         ...PaginationFields,
       },
       outputSchema: FlowStepListEnvelope,
@@ -316,7 +442,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "lesson_id": "lsn_abc", "title": "Morning", "content": "Buenos días means good morning.", "is_starting_step": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if lesson_id invalid; FLOWLEARN_API_400 on invalid step_type.",
       inputSchema: {
-        lesson_id: z.string().min(1),
+        lesson_id: IdSchema,
         title: z.string().min(1),
         content: z.string().describe("Step body text shown to the learner"),
         description: z.string().optional(),
@@ -334,7 +460,8 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ lesson_id, client_request_id, ...body }) => {
-        const cached = getIdempotent(client_request_id as string | undefined);
+        const tenantSlug = cfg().tenantSlug;
+        const cached = getIdempotentScoped(tenantSlug, client_request_id as string | undefined);
         if (cached) return cached;
         const data = await client.request<{ flow_step?: Record<string, unknown> }>(
           `/api/lessons/${lesson_id}/flow-steps`,
@@ -345,13 +472,13 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         const result = entityResult({
           entity,
           summary: `Created flow step '${entity.title}' (id=${id}, type=${entity.step_type ?? "message"}) in lesson ${lesson_id}.`,
-          url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "flow_step", id, { lessonId: String(lesson_id) }),
+          url: editorUrl(cfg().baseUrl, tenantSlug, "flow_step", id, { lessonId: String(lesson_id) }),
           next_actions: [
             `flowlearn_connection_add with flow_step_id="${id}" to wire it to the next step`,
             `flowlearn_flow_step_upload_image with flow_step_id="${id}" if this step needs an image`,
           ],
         });
-        setIdempotent(client_request_id as string | undefined, result);
+        setIdempotentScoped(tenantSlug, client_request_id as string | undefined, result);
         return result;
       },
     },
@@ -367,7 +494,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "lesson_id": "lsn_abc", "steps": [{"title":"Intro","content":"...","is_starting_step":true},{"title":"Detail","content":"..."}] }\n\n' +
         "Errors: FLOWLEARN_API_404 if lesson_id invalid; FLOWLEARN_BULK_CREATE_PARTIAL with details.created/details.failed_index on mid-batch failure.",
       inputSchema: {
-        lesson_id: z.string().min(1),
+        lesson_id: IdSchema,
         steps: z
           .array(
             z.object({
@@ -376,7 +503,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
               description: z.string().optional(),
               step_type: StepTypeEnum.optional(),
               is_starting_step: z.boolean().optional(),
-            }),
+            }).strict(),
           )
           .min(1),
         ...IdempotencyField,
@@ -419,7 +546,8 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
           });
         }
 
-        const cached = getIdempotent(client_request_id as string | undefined);
+        const tenantSlug = cfg().tenantSlug;
+        const cached = getIdempotentScoped(tenantSlug, client_request_id as string | undefined);
         if (cached) return cached;
 
         const created: Record<string, unknown>[] = [];
@@ -471,7 +599,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
             `flowlearn_connection_add to wire the new steps; or use flowlearn_course_outline_apply next time to bundle steps + connections in one call.`,
           ],
         });
-        setIdempotent(client_request_id as string | undefined, result);
+        setIdempotentScoped(tenantSlug, client_request_id as string | undefined, result);
         return result;
       },
     },
@@ -486,7 +614,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_abc", "new_position": 0 }\n\n' +
         "Errors: FLOWLEARN_API_404 if flow_step_id invalid; INVALID_ARGUMENTS if new_position is out of range.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
+        flow_step_id: IdSchema,
         new_position: z
           .number()
           .int()
@@ -619,7 +747,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_abc", "content": "Updated text" }\n\n' +
         "Errors: FLOWLEARN_API_404 if flow_step_id invalid.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
+        flow_step_id: IdSchema,
         title: z.string().optional(),
         description: z.string().optional(),
         content: z.string().optional(),
@@ -630,11 +758,11 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         buttons: z
           .array(
             z.object({
-              id: z.string().optional(),
-              targetStepId: z.string().nullable().optional(),
+              id: IdSchema.optional(),
+              targetStepId: IdSchema.nullable().optional(),
               text: z.string().optional(),
               action: ButtonActionEnum.optional(),
-            }),
+            }).strict(),
           )
           .optional()
           .describe("If provided, FULLY REPLACES the step's outgoing connections"),
@@ -670,7 +798,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_abc", "dry_run": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if flow_step_id invalid.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
+        flow_step_id: IdSchema,
         ...DryRunField,
       },
       outputSchema: z.object({
@@ -729,8 +857,8 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "lesson_id": "lsn_abc", "steps": [{"id":"stp_2"},{"id":"stp_1"},{"id":"stp_3"}] }\n\n' +
         "Errors: FLOWLEARN_API_400 if any id doesn't belong to lesson_id.",
       inputSchema: {
-        lesson_id: z.string().min(1),
-        steps: z.array(z.object({ id: z.string() })).min(1),
+        lesson_id: IdSchema,
+        steps: z.array(z.object({ id: IdSchema }).strict()).min(1),
       },
       outputSchema: z.object({
         entity: z.record(z.unknown()),
@@ -745,13 +873,38 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         openWorldHint: true,
       },
       handler: async ({ lesson_id, steps }) => {
+        // Parent-ownership check: every submitted step id MUST belong to
+        // lesson_id. Without this, a malicious caller could reorder steps
+        // from a different lesson the user happens to also own — orphaning
+        // or hijacking them depending on upstream behaviour. We enforce
+        // client-side rather than rely on the server to reject.
+        const stepArr = steps as { id: string }[];
+        const submittedIds = stepArr.map((s) => s.id);
+        const listResp = await client.request<unknown>(
+          `/api/lessons/${lesson_id}/flow-steps`,
+        );
+        const owned = (Array.isArray(listResp)
+          ? listResp
+          : (listResp as { flow_steps?: unknown[] })?.flow_steps ?? []) as Record<string, unknown>[];
+        const ownedIds = new Set(owned.map((s) => String(s.id)));
+        const foreign = submittedIds.filter((id) => !ownedIds.has(id));
+        if (foreign.length > 0) {
+          return errorResult({
+            code: "INVALID_ARGUMENTS",
+            message: `${foreign.length} step id(s) do not belong to lesson ${lesson_id}: ${foreign.join(", ")}.`,
+            suggestion: `Call flowlearn_flow_step_list with lesson_id="${lesson_id}" to get the valid ids first.`,
+            retriable: false,
+            details: { lesson_id: String(lesson_id), foreign_ids: foreign },
+          });
+        }
+
         const data = await client.request<unknown>(
           `/api/lessons/${lesson_id}/flow-steps/reorder`,
           { method: "PUT", body: { steps } },
         );
         return entityResult({
           entity: data as Record<string, unknown>,
-          summary: `Reordered ${(steps as { id: string }[]).length} steps in lesson ${lesson_id}.`,
+          summary: `Reordered ${stepArr.length} steps in lesson ${lesson_id}.`,
           next_actions: [`flowlearn_flow_step_list with lesson_id="${lesson_id}" to verify`],
         });
       },
@@ -771,19 +924,19 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_abc", "image_path": "C:\\\\Users\\\\me\\\\screenshot.png" }\n\n' +
         "Errors: INVALID_ARGUMENTS (zero or multiple sources, relative path, bad URL scheme); IMAGE_TOO_LARGE (>10 MB); IMAGE_INVALID_FORMAT (not PNG/JPEG/WebP/GIF); IMAGE_READ_FAILED (path unreadable); IMAGE_FETCH_FAILED (URL unreachable or non-2xx); FLOWLEARN_API_400 on API rejection; FLOWLEARN_API_404 on bad flow_step_id.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
+        flow_step_id: IdSchema,
         image_path: z
           .string()
           .min(1)
           .optional()
           .describe(
-            "Absolute filesystem path to a PNG/JPEG/WebP/GIF file. Preferred for Claude Code users.",
+            "Absolute filesystem path to a PNG/JPEG/WebP/GIF file. By default only paths under the user's home directory are allowed; override the allowlist with the FLOWLEARN_ALLOWED_IMAGE_DIRS env var.",
           ),
         image_url: z
           .string()
           .url()
           .optional()
-          .describe("Public http(s) URL the MCP server fetches."),
+          .describe("Public http(s) URL the MCP server fetches. Private/loopback/link-local IPs are rejected."),
         image_data: z
           .string()
           .min(1)
@@ -867,7 +1020,7 @@ export function buildFlowStepTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "flow_step_id": "stp_abc", "dry_run": true }\n\n' +
         "Errors: FLOWLEARN_API_404 if flow_step_id invalid.",
       inputSchema: {
-        flow_step_id: z.string().min(1),
+        flow_step_id: IdSchema,
         ...DryRunField,
       },
       outputSchema: z.object({

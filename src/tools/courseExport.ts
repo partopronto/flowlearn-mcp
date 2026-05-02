@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { FlowlearnClient } from "../client.js";
-import { entityResult, type ToolDef } from "./common.js";
+import { IdSchema, entityResult, type ToolDef } from "./common.js";
 
 /**
  * Round-trip an existing course back to outline shape. The output is
@@ -88,7 +88,7 @@ export function buildCourseExportTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "course_id": "crs_abc" }\n\n' +
         "Errors / caveats: FLOWLEARN_API_404 if course_id invalid. Cross-lesson connection edges are NOT supported by outline_apply (its connections[] are positional indices into a single lesson's steps[]). If the source course contains connections that point at flow_steps in a different lesson, those edges are OMITTED from the exported tree and surfaced under top-level `warnings[]` so the agent can see what was dropped.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
       },
       outputSchema: OutlineExportEnvelope,
       annotations: {

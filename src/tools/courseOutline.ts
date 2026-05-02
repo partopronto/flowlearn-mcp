@@ -1,12 +1,13 @@
 import { z } from "zod";
 import type { FlowlearnClient } from "../client.js";
 import {
+  IdSchema,
   IdempotencyField,
   editorUrl,
   entityResult,
   errorResult,
-  getIdempotent,
-  setIdempotent,
+  getIdempotentScoped,
+  setIdempotentScoped,
   type ToolDef,
   type ToolResult,
 } from "./common.js";
@@ -378,7 +379,8 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
           });
         }
 
-        const cached = getIdempotent(client_request_id);
+        const tenantSlug = cfg().tenantSlug;
+        const cached = getIdempotentScoped(tenantSlug, client_request_id);
         if (cached) return cached;
 
         const created: CreatedTree = {
@@ -532,16 +534,16 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
               published,
             },
             summary: `Created course '${course.title}' (id=${courseId}) with ${stats.modules} modules, ${stats.lessons} lessons, ${stats.flow_steps} flow steps, ${stats.connections} connections${mark_flow_completed ? ", all flow_completed=true" : ""}${published ? ", status=published" : ""}.`,
-            url: editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", courseId),
+            url: editorUrl(cfg().baseUrl, tenantSlug, "course", courseId),
             resource_uri: `flowlearn://course/${courseId}`,
             next_actions: published
-              ? [`Course is live at ${editorUrl(cfg().baseUrl, cfg().tenantSlug, "course", courseId)}`]
+              ? [`Course is live at ${editorUrl(cfg().baseUrl, tenantSlug, "course", courseId)}`]
               : [
                   `flowlearn_course_lint with course_id="${courseId}" to verify publish-readiness`,
                   `flowlearn_course_update with course_id="${courseId}" + status="published" to publish`,
                 ],
           });
-          setIdempotent(client_request_id, result);
+          setIdempotentScoped(tenantSlug, client_request_id, result);
           return result;
         } catch (err) {
           const partial = {
@@ -609,7 +611,7 @@ export function buildCourseOutlineTools(client: FlowlearnClient): ToolDef[] {
         'Example call: { "course_id": "crs_abc", "proposed": { "title": "Spanish Greetings", "topic": "Greetings", "modules": [{ "title": "Hellos", "lessons": [{ "title": "Saying Hello", "steps": [{"title":"Hola","content":"Most common greeting."}] }] }] } }\n\n' +
         "Errors: FLOWLEARN_API_404 if course_id invalid; INVALID_ARGUMENTS if proposed schema fails Zod validation.",
       inputSchema: {
-        course_id: z.string().min(1),
+        course_id: IdSchema,
         proposed: CourseInput.extend({
           description: z
             .string()
